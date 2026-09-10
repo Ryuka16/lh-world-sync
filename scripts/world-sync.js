@@ -1,6 +1,12 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.2.9
+ * 世界同步装置 (lh-world-sync) v1.3.0
  * ----------------------------------------------------------------------------
+ * v1.3.0：第七轮整体盲审剩下的 13 项一次收口 —— 导入体积上限 32MB（读之前校验）/
+ *   快照拒收「始终排除键」/ 缺少稳定世界标识时拒绝写账本 / 回滚按本次真正创建的
+ *   文档 id 删除 / 网络读取 30 秒超时（覆盖响应头与 body）/ 自动刷新前检查是否有
+ *   操作在跑 / 复制剪贴板改为可 await 可失败 / 导出与差异清单的口径写清 /
+ *   当前世界键值 2 秒短时缓存 / 不可用项去重改 Set / 玩家端不暴露写入口、
+ *   自动提醒开关对玩家隐藏。
  * v1.2.9：第八轮 —— 收掉「多副本」结构病里的前两处（第八轮整体盲审点名四类
  *   「同一事实存多份副本」，本轮拆掉其中的读错误与互斥两类）：
  *   ① 【S5】「哪个文件读失败了」原来由单个模块级变量 storageLastError 承载，
@@ -329,7 +335,7 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.2.9";
+const MODULE_VERSION = "1.3.0";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
@@ -481,12 +487,11 @@ Hooks.on("init", () => {
 /* ============================ 工具 ============================ */
 const norm = (p) => String(p).replace(/\\/g, "/").replace(/^\/+/, "");
 const getTheme = () => game.settings.get(MODULE_ID, THEME_SETTING) || "deep";
+// v1.3.0（卫生）：原来用全局 $(".wsync-app") 找窗口 —— 那是本模块给 Dialog 加的 class，
+// 但弹窗关闭后元素会在 DOM 里滞留约 200ms（slideUp 动画），此时换主题会改写一个
+// 正在消失的窗口。现在只改真正带主题类的窗口。
 const setTheme = (t) => game.settings.set(MODULE_ID, THEME_SETTING, t).then(() => {
-  const winEl = $(".wsync-app");
-  winEl.each((i, el) => {
-    const $w = $(el);
-    $w.attr("data-theme", t);
-  });
+  $(".window-app.wsync-themed").each((i, el) => { $(el).attr("data-theme", t); });
 });
 // 稳定序列化（键名排序）：JSON.stringify 对 {a:1,b:2} 与 {b:2,a:1} 给出不同结果，
 // 直接拿来深比较会把「同值不同键序」误判成差异，导致假差异（审阅第 12 条）。
@@ -510,7 +515,13 @@ const notify = {
   warn: (m) => ui.notifications.warn(m, { console: false }),
   err: (m) => ui.notifications.error(m, { console: false })
 };
-const copyText = (text) => game.clipboard.copyPlainText(text);
+// v1.3.0（C1）：copyPlainText 返回 Promise，原来既不 await 也不 catch —— 剪贴板被
+// 浏览器拒绝（HTTP 非安全上下文、权限被拒）时会变成「未处理的 Promise 拒绝」，
+// 而面板照样显示「已复制」，用户去粘贴得到的是上一次的内容。
+const copyText = async (text) => {
+  if (!game.clipboard?.copyPlainText) throw new Error("当前浏览器不支持复制，请手动选中文本复制");
+  await game.clipboard.copyPlainText(text);
+};
 // 文件名时间戳：world-snapshot-20260909-1231.json
 // 用本地时间、不含 T/Z/冒号，任何操作系统都不会因非法字符丢扩展名
 const stamp = () => {
@@ -587,30 +598,45 @@ let applyLogCorrupt = null;          // { reason: string, backup: string|null } 
 // 账本、旧账本……后一次读覆盖前一次，于是「404 清空 → 5xx 又写回」这类交错让上层很难说清
 // 谁出了问题（六轮审阅里「读失败被当成不存在」反复出现在不同路径）。把「读到什么」和
 // 「为什么没读到」一起返回，上层就不必再去猜一个全局变量的当前值。
+const STORAGE_TIMEOUT_MS = 30000;
 async function storageRead(name) {
   const url = foundry.utils.getRoute(norm(STORAGE_DIR) + "/" + name);
   let r;
+  // v1.3.0（C2）：30 秒超时。原来没有超时 —— 服务器「TCP 连上但不回包」时 fetch 会
+  // 一直挂着，面板停在读取中，用户唯一能做的是刷新页面；而刷新正是本项目历史上出过
+  // 事的入口（两套互斥同时归零、撤销点被覆盖）。超时同时覆盖响应头与响应体两段。
+  // 用 typeof 探测而不是直接引用：vm 沙箱一类的运行环境可能没有 AbortController，
+  // 那时退化成「无超时」继续工作，而不是抛 ReferenceError 把整个读取流程打断。
+  const hasAbort = (typeof AbortController !== "undefined") && (typeof setTimeout === "function");
+  const ctl = hasAbort ? new AbortController() : null;
+  const timer = hasAbort ? setTimeout(() => ctl.abort(), STORAGE_TIMEOUT_MS) : null;
   try {
-    r = await fetch(url, { cache: "no-store" });
-  } catch (e) {
-    console.warn("[lh-world-sync] 读取失败：" + url, e);
-    return { text: null, error: "无法连接服务器（" + (e?.message || e) + "）" };
-  }
-  // 只有 404 才是「服务器明确说这个文件不存在」，其余失败都不能当成「没有」
-  if (r.status === 404) return { text: null, error: null };
-  if (!r.ok) {
-    console.warn("[lh-world-sync] 读取失败：" + url + " → HTTP " + r.status);
-    return { text: null, error: "服务器返回 HTTP " + r.status + "（" + name + "）" };
-  }
-  // v1.2.4：读 body 必须包在 try 里。原来这行在函数内任何 try 之外，
-  // 连接在「响应头已到、body 还没读完」时中断 → 异常直接逃到调用点；
-  // 而 openRestoreConfirm 的首行、面板按钮回调都没有 catch，
-  // 用户看到的现象是「点了没反应」（无提示、无日志）。
-  try {
-    return { text: await r.text(), error: null };
-  } catch (e) {
-    console.warn("[lh-world-sync] 读取响应失败：" + url, e);
-    return { text: null, error: "读取响应内容失败（" + (e?.message || e) + "）" };
+    try {
+      r = await fetch(url, { cache: "no-store", signal: ctl ? ctl.signal : null });
+    } catch (e) {
+      console.warn("[lh-world-sync] 读取失败：" + url, e);
+      return { text: null, error: (e?.name === "AbortError")
+        ? ("服务器响应超时（超过 " + Math.round(STORAGE_TIMEOUT_MS / 1000) + " 秒无响应）")
+        : ("无法连接服务器（" + (e?.message || e) + "）") };
+    }
+    // 只有 404 才是「服务器明确说这个文件不存在」，其余失败都不能当成「没有」
+    if (r.status === 404) return { text: null, error: null };
+    if (!r.ok) {
+      console.warn("[lh-world-sync] 读取失败：" + url + " → HTTP " + r.status);
+      return { text: null, error: "服务器返回 HTTP " + r.status + "（" + name + "）" };
+    }
+    // v1.2.4：读 body 必须包在 try 里。原来这行在函数内任何 try 之外，
+    // 连接在「响应头已到、body 还没读完」时中断 → 异常直接逃到调用点；
+    // 而 openRestoreConfirm 的首行、面板按钮回调都没有 catch，
+    // 用户看到的现象是「点了没反应」（无提示、无日志）。
+    try {
+      return { text: await r.text(), error: null };
+    } catch (e) {
+      console.warn("[lh-world-sync] 读取响应失败：" + url, e);
+      return { text: null, error: "读取响应内容失败（" + (e?.message || e) + "）" };
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 /* ---------- 权限与操作锁（v1.1.0） ---------- */
@@ -872,6 +898,14 @@ function parseSnapshot(text) {
       throw new Error("快照条目的 value 无法写入（" + typeof item.value + "）：" + item.key);
     }
     if (seen.has(item.key)) throw new Error("快照里有重复的设置键：" + item.key);
+    // v1.3.0（D2）：本模块永不同步的键，外来快照也不许带进来。
+    // 这三项在 EXCLUDE_DEFAULT 恒定排除：core.permissions 是官方 GAMEMASTER_ONLY_KEYS
+    //（common/documents/setting.mjs:57），写它需要 GM 角色，Assistant GM 会被服务端拒；
+    // core.time 是世界时间戳，搬到别的世界会错乱。本模块产出的快照不会有这些键，
+    // 出现即说明文件被手工改过或来自别处。
+    if (EXCLUDE_DEFAULT.includes(item.key)) {
+      throw new Error("快照里含有本模块始终排除的设置键：" + item.key + " —— 这类键不参与同步，已拒绝导入。");
+    }
     // v1.2.2：拒绝本模块自身的设置键。collectWorldSettings 导出时会跳过它们，
     // 所以本模块产出的快照不会有；外来 / 手工改过的快照若带着
     // lh-world-sync.nsScope 这类键，写入阶段会因为「当前世界查不到这个文档」
@@ -911,8 +945,25 @@ function describeSnapshotCompat(snap) {
 
 /* ---------- 差异 ---------- */
 // selection: { ns: { [ns]: true }, includeModuleConfig: bool }
-function diffSnapshot(snap, selection) {
-  const current = new Map([...collectWorldSettings().entries()].map(([k, v]) => [k, v.value]));
+// v1.3.0（E1）：当前世界键值 Map 的短时缓存。
+// 面板里每勾一下就要重算一遍差异（1435 项），而当前世界的设置在这几百毫秒里不会变，
+// 每次重新遍历 Settings 集合、重建 Map 纯属白做。用 2 秒 TTL 而不是单一作废点：
+// 少一个「忘了清缓存」的漏点；而写操作之后的状态刷新会显式清（见 refreshStatus）。
+const CURRENT_MAP_TTL_MS = 2000;
+let currentMapCache = null;
+let currentMapCacheAt = 0;
+function getCurrentMap() {
+  const now = Date.now();
+  if (currentMapCache && (now - currentMapCacheAt) < CURRENT_MAP_TTL_MS) return currentMapCache;
+  currentMapCache = new Map([...collectWorldSettings().entries()].map(([k, v]) => [k, v.value]));
+  currentMapCacheAt = now;
+  return currentMapCache;
+}
+// v1.3.0（E1）：第三参数可传入「已展开的当前世界键值 Map」；不给则走上面的短时缓存
+function diffSnapshot(snap, selection, currentOverride) {
+  const current = (currentOverride instanceof Map)
+    ? currentOverride
+    : getCurrentMap();
   const changed = [];
   const nsCount = {};
   for (const item of snap.settings) {
@@ -1088,7 +1139,17 @@ async function readApplyLogStore() {
   return emptyApplyLogStore();
 }
 // 写入时只覆盖「本世界」那一格，其他世界的记录原样保留
+// v1.3.0（D3）：账本文件名由 world.id 生成。Foundry 一定给 id（client-documents 的
+// exportToJSON 也用 game.world.id 标世界归属），但万一取不到，currentWorldId() 会退回
+// 世界标题 —— 两个同名世界就会写到同一份账本、互相挤掉对方的撤销点。
+// 宁可拒绝写账本（本次恢复不执行、世界零改动），也不制造一个会串数据的文件。
+function hasStableWorldId() {
+  return !!(game.world?.id ?? game.world?._id);
+}
 async function writeApplyLog(prevMap, afterMap) {
+  if (!hasStableWorldId()) {
+    throw new Error("当前世界没有稳定标识（game.world.id 取不到），无法安全地写回档账本 —— 本次操作已中止，世界未做任何改动。");
+  }
   const store = await readApplyLogStore();
   // v1.2.4：账本读失败时绝不覆盖写。
   // 覆盖会把「上一次恢复前的值」永久挤掉 —— 服务器上没有账本的备份，
@@ -1243,12 +1304,16 @@ function isNsUnavailable(key) {
 function collectUnavailable(snap, selection) {
   const sel = selection ?? { ns: {}, includeModuleConfig: false };
   const out = [];
+  // v1.3.0（E2）：原来用 out.includes(key) 去重 —— 1435 项的快照上这是 O(n²)，
+  // 而本函数在面板每次刷新、每次勾选变化、每次恢复前后都会被调用。
+  const seen = new Set();
   for (const item of (snap?.settings ?? [])) {
     const key = String(item?.key ?? "");
-    if (!key || out.includes(key)) continue;
+    if (!key || seen.has(key)) continue;
     if (isExcludedKey(key)) continue;
     if (!isNsUnavailable(key)) continue;
     if (!sel?.ns?.[key.split(".")[0]]) continue;
+    seen.add(key);
     out.push(key);
   }
   return out;
@@ -1339,9 +1404,20 @@ async function applySnapshot(snap, selection, precomputed) {
       e0.__notStarted = true;
       throw e0;
     }
+    // v1.3.0（D1）：本次新建文档的 key → _id（失败回滚时精确删除用）
+    const createdByKey = new Map();
     try {
       if (updates.length) await SettingDoc.updateDocuments(updates, {});
-      if (creates.length) await SettingDoc.createDocuments(creates, {});
+      // v1.3.0（D1）：记住本次真正创建出来的文档 id，失败回滚按它删 —— 不再靠
+      // getSettingDoc 反查：刚创建的文档在集合缓存里可能还查不到，反查落空会把
+      // 「本该删掉的新文档」留在世界里，成为同 key 的第二份 Setting（取哪份不确定）。
+      if (creates.length) {
+        const made = await SettingDoc.createDocuments(creates, {});
+        for (const d of (made ?? [])) {
+          const id = d?._id ?? d?.id;
+          if (id && d?.key) createdByKey.set(d.key, id);
+        }
+      }
     } catch (e) {
       // v1.2.5：这个判断是防御性的 —— 账本写失败在更外层的 try 里就已经标记并上抛，
       // 正常执行到不了这里。保留是为了将来若有代码把带 __notStarted 的异常放进这个 try，
@@ -1357,7 +1433,10 @@ async function applySnapshot(snap, selection, precomputed) {
           const p = prevMap.get(c.key);
           const doc = getSettingDoc(c.key);
           if (!p.present) {
-            if (doc?._id) d2.push(doc._id);
+            // v1.3.0（D1）：本次新建的按记录下来的 id 删（最准）；否则回退到反查
+            const newId = createdByKey.get(c.key);
+            if (newId) d2.push(newId);
+            else if (doc?._id) d2.push(doc._id);
           } else if (doc?._id) {
             u2.push({ _id: doc._id, value: JSON.stringify(p.value) });
           } else {
@@ -1440,10 +1519,18 @@ async function rollbackApplyLog() {
       }
     }
     // ② 批量执行（v1.2.1：原来逐条 await，1300 项就是 1300 次往返）
+    // v1.3.0（D1）：同 applySnapshot —— 记录本次新建文档的 id，供失败还原精确删除
+    const createdByKey = new Map();
     try {
       if (deletes.length) await SettingDoc.deleteDocuments(deletes, {});
       if (updates.length) await SettingDoc.updateDocuments(updates, {});
-      if (creates.length) await SettingDoc.createDocuments(creates, {});
+      if (creates.length) {
+        const made = await SettingDoc.createDocuments(creates, {});
+        for (const d of (made ?? [])) {
+          const id = d?._id ?? d?.id;
+          if (id && d?.key) createdByKey.set(d.key, id);
+        }
+      }
     } catch (e) {
       // ③ 失败回滚：把已碰过的键还原成「回档前」的样子，绝不停在半回档状态
       console.error("[lh-world-sync] 回档失败，正在还原到回档前状态", e);
@@ -1453,7 +1540,10 @@ async function rollbackApplyLog() {
         const b = before.get(key);
         const doc = getSettingDoc(key);
         if (!b?.present) {
-          if (doc?._id) d2.push(doc._id);
+          // v1.3.0（D1）：本次新建的按记录下来的 id 删，避免反查落空留下孤儿文档
+          const newId = createdByKey.get(key);
+          if (newId) d2.push(newId);
+          else if (doc?._id) d2.push(doc._id);
         } else {
           const json = JSON.stringify(keepSelfEnabled(key, b.value));
           if (doc?._id) u2.push({ _id: doc._id, value: json });
@@ -1685,7 +1775,10 @@ function openDiffDialog(changed, options = {}) {
     const tag = describeChange(c.from, c.to);
     return `<div class="wsync-diff-row"><code>${escapeHtml(c.key)}</code><span class="wsync-diff-tag">${tag}</span><div class="wsync-diff-vals"><span class="wsync-v-now">${escapeHtml(shortVal(c.from))}</span><span class="wsync-v-arrow">→</span><span class="wsync-v-master">${escapeHtml(shortVal(c.to))}</span></div></div>`;
   }).join("");
-  const trimmed = changed.length > 120 ? `<div class="wsync-diff-more">…还有 ${changed.length - 120} 项（完整清单见「导出快照」）</div>` : "";
+  // v1.3.0（B1）：原来说「完整清单见导出快照」—— 导出的是当前世界的设置**值**，
+  // 不含差异标记，用户照它根本对不出「还有哪 200 项不同」。改为真的把清单给出去。
+  try { console.log("[lh-world-sync] 差异清单（" + changed.length + " 项）", changed.map(c => c.key)); } catch (e) { /* 忽略 */ }
+  const trimmed = changed.length > 120 ? `<div class="wsync-diff-more">…还有 ${changed.length - 120} 项。<b>完整清单已输出到浏览器控制台</b>（F12 → Console，搜 lh-world-sync）。</div>` : "";
   const buttons = {
     apply: {
       icon: "<i class=\"fa-solid fa-check\"></i>",
@@ -1767,7 +1860,16 @@ function openApplyReportDialog(applied, skipped) {
   saveLastReport(applied, skipped);
   // v1.2.1：自动刷新延迟 10 秒（原来 3 秒，150 项清单根本来不及看），并给出手动选项
   const RELOAD_MS = 10000;
-  const timer = setTimeout(() => window.location.reload(), RELOAD_MS);
+  // v1.3.0（C3）：自动刷新前先看有没有操作正在跑。刷新会掐断进行中的写入，而本项目
+  // 历史上最危险的一次事故正是「恢复途中刷新」——两道互斥同时归零、撤销点被下一次
+  // 恢复覆盖、世界停在从未存在过的中间态。宁可让用户自己决定何时刷新。
+  const timer = setTimeout(() => {
+    if (_opInFlightAt) {
+      notify.warn("检测到仍有操作正在进行，已暂停自动刷新。请等操作结束后手动刷新页面（F5）。");
+      return;
+    }
+    window.location.reload();
+  }, RELOAD_MS);
   new Dialog({
     title: `恢复完成 · ${RELOAD_MS / 1000} 秒后自动刷新`,
     content: `<div class="wsync-body"><div class="wsync-diff-summary">已恢复 <b>${applied.length}</b> 项设置。${hasModCfg ? "<b>模组启用状态已一并恢复</b>（此前被关闭的模组将重新启用）。" : ""}<br>页面将在 ${RELOAD_MS / 1000} 秒后自动刷新并生效。刷新完成后，仍可在面板里查看这次改动的清单。如需撤销，刷新完成后点「回档」。</div>${skippedNote}${lines}${trimmed}</div>`,
@@ -1948,10 +2050,10 @@ function openFilePanel() {
   const dlg = new Dialog({
     title: "世界同步装置 · 文件",
     content: `<div class="wsync-body">
-      <div class="wsync-file-note">快照保存在模块 storage 目录，所有世界共享读取。可导出文件下载到本地或复制全文，用于跨服务器迁移。</div>
+      <div class="wsync-file-note">快照保存在模块 storage 目录，所有世界共享读取。<b>下面「导出 / 复制」导出的都是当前世界的实时设置</b>，不是服务器上那份主快照 —— 它用于备份或搬到别的服务器。想直接拿主快照本身，请在服务器上取 storage 目录里的 world-snapshot-master.json。</div>
       <div class="wsync-file-btns">
-        <button class="wsync-btn" data-file="export-snap">导出快照（下载文件）</button>
-        <button class="wsync-btn" data-file="copy-full">复制快照全文</button>
+        <button class="wsync-btn" data-file="export-snap">导出当前世界设置（下载文件）</button>
+        <button class="wsync-btn" data-file="copy-full">复制当前世界设置全文</button>
         <button class="wsync-btn" data-file="import-file">从文件导入</button>
         <button class="wsync-btn" data-file="paste-snap">粘贴快照</button>
       </div>
@@ -1983,8 +2085,10 @@ function openFilePanel() {
         } catch (e) { setMsg(false, "导出失败:" + (e?.message || e)); }
       });
       $h.find("[data-file=copy-full]").on("click", async () => {
-        try { copyText(JSON.stringify(buildSnapshot(), null, 2)); setMsg(true, "快照全文已复制到剪贴板。"); }
-        catch (e) { setMsg(false, "复制失败:" + (e?.message || e)); }
+        // v1.3.0（C1）：copyText 现在是 async，必须 await —— 否则「复制失败」的提示
+        // 永远抢在真实结果之前，失败会被显示成成功。
+        try { await copyText(JSON.stringify(buildSnapshot(), null, 2)); setMsg(true, "当前世界设置全文已复制到剪贴板。"); }
+        catch (e) { setMsg(false, "复制失败：" + (e?.message || e)); }
       });
       $h.find("[data-file=import-file]").on("click", () => {
         const input = document.createElement("input");
@@ -1992,6 +2096,13 @@ function openFilePanel() {
         input.onchange = async () => {
           const f = input.files?.[0];
           if (!f) return;
+          // v1.3.0（E3）：先看体积再读进内存。f.text() 是全量读入 —— 一份几百 MB 的
+          // 文件会让浏览器直接卡死，校验必须在读之前。
+          const MAX_IMPORT_BYTES = 32 * 1024 * 1024;
+          if (f.size > MAX_IMPORT_BYTES) {
+            setMsg(false, "文件太大（" + Math.round(f.size / 1048576) + " MB，上限 32 MB）：这可能不是本模块产出的快照。");
+            return;
+          }
           try {
             const snap = parseSnapshot(await f.text());
             openSnapImportDialog(snap);
@@ -2069,6 +2180,7 @@ async function openSnapImportDialog(snap) {
           notify.ok(`已设为主快照（来源：${escapeHtml(snap.sourceWorld || "未知世界")}，${n} 项）。`
             + (r.backed ? `；上一份已备份为 ${r.backed}` : "；此前没有旧主快照，无需备份"));
           statusSnapCache = null;   // v1.2.4：基准换了 → 面板状态栏缓存作废，否则一直显示旧基准
+          panelDirty = true;        // v1.3.0（B6）：让面板下次渲染强制重读新基准
         } catch (e) { console.error(e); notify.err("写入主快照失败:" + (e?.message || e)); return; }
         new Dialog({
           title: "主快照已更新",
@@ -2154,6 +2266,9 @@ async function openRestoreConfirm($body) {
 }
 // v1.2.1：状态检测用的快照缓存 —— 面板里改勾选时只重算差异，不重新下载整个快照
 let statusSnapCache = null;
+// v1.3.0（B6）：面板之外的地方换过基准（导入并设为主快照）时置位 ——
+// 面板下次渲染时据此强制重读，不让状态栏停在旧基准上。
+let panelDirty = false;
 // v1.2.2：面板单例 —— 侧边栏按钮连点两次会开出两个面板窗口，
 // 而面板内的状态刷新原来用全局选择器 $(".wsync-app.wsync-panel").first()，
 // 会把状态写进「先开的那个」窗口，第二个面板永远停在「正在读取…」。
@@ -2263,7 +2378,13 @@ async function openSyncPanel() {
       // 不再 force —— 原来 force=true 会立刻重读一遍，于是 v1.2.4 那句「面板不再读两次快照」
       // 等于没生效：模块勾选列表来自第 1 次读、状态栏差异数来自第 2 次读，两次之间
       // 别的 GM 更新了主快照，两处就基于不同基准（第三轮盲审）。存主世界后的刷新仍用 force。
-      refreshStatus(false);
+      // v1.3.0（B6）：若期间有「设为主快照」换过基准，强制重读一次；
+      // 否则复用 openSyncPanel 刚读过的那份（v1.2.5 的性能优化）。
+      refreshStatus(panelDirty);
+      panelDirty = false;
+      // v1.3.0（卫生）：自动提醒是 GM 专属功能（autoPromptCheck 首行就是 isGM 检查），
+      // 玩家看到这个开关只会困惑 —— 勾上它不会发生任何事。
+      if (!game.user?.isGM) $h.find("#wsync-autoprompt").closest("label").hide();
       // 高级区：看差异 / 文件面板
       $h.find("[data-act=preview]").on("click", () => { openRestoreConfirm($h); });
       // v1.2.1：状态栏里「上一次恢复改动了什么」的入口。内容由 refreshStatus 动态追加，
@@ -2361,6 +2482,8 @@ async function openSyncPanel() {
       let statusReadError = null;
       if (snapOverride && typeof snapOverride === "object" && Array.isArray(snapOverride.settings)) {
         statusSnapCache = snapOverride;
+        // v1.3.0（E1）：拿到「刚写入的快照」说明世界刚被写过 → 当前世界键值缓存必须作废
+        currentMapCache = null;
       } else if (snapOverride || !statusSnapCache) {
         statusSnapCache = null;
         // v1.2.9（S5）：读取结果与失败原因一起拿到，不再依赖模块级单变量
@@ -2551,17 +2674,13 @@ Hooks.on("init", () => { registerMenuIfPossible(); });
 Hooks.on("ready", () => {
   if (game.user.isGM) ensureSidebarButton();
 });
-// 控制台接口：所有写操作在函数内部统一 assertGM()（审阅第 10 条）；
+// 控制台接口：写操作在函数内部统一 assertGM()（审阅第 10 条）；
 // readScopePref / buildSelection 一并暴露，便于排查「为什么这一项没被恢复」。
-window.lhWorldSync = {
-  version: MODULE_VERSION,
-  openPanel: openSyncPanel,
-  buildSnapshot,
-  parseSnapshot,
-  diffSnapshot,
-  applySnapshot,
-  rollback: rollbackApplyLog,              // v1.2.9（B4）：闸与锁都在函数内部统一处理
-  readScopePref,
-  buildSelection
-};
+// v1.3.0（卫生）：写入口只挂在 GM 的 window 上。函数内部本来就有 assertGM() 兜底，
+// 但把 applySnapshot / rollback 直接摆在玩家端的全局对象里，等于给「绕过 UI 直接调」
+// 留了一个显眼入口 —— 不构成漏洞，但没有理由摆在那里。
+const _readonlyApi = { version: MODULE_VERSION, openPanel: openSyncPanel, buildSnapshot, parseSnapshot, diffSnapshot, readScopePref, buildSelection };
+window.lhWorldSync = game.user?.isGM
+  ? { ..._readonlyApi, applySnapshot, rollback: rollbackApplyLog }
+  : _readonlyApi;
 console.log(`lh-world-sync v${MODULE_VERSION} loaded (window.__WSYNC_VER=${window.__WSYNC_VER})`);
