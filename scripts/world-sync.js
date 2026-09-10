@@ -1,5 +1,22 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.2.8
+ * 世界同步装置 (lh-world-sync) v1.2.9
+ * ----------------------------------------------------------------------------
+ * v1.2.9：第八轮 —— 收掉「多副本」结构病里的前两处（第八轮整体盲审点名四类
+ *   「同一事实存多份副本」，本轮拆掉其中的读错误与互斥两类）：
+ *   ① 【S5】「哪个文件读失败了」原来由单个模块级变量 storageLastError 承载，
+ *      而一次操作会依次读锁文件 → 主快照 → 账本 → 旧账本，后一次读覆盖前一次；
+ *      「404 清空、5xx 又写回」这类交错让上层根本说不清是哪个文件出了问题，
+ *      而这正是多条错误提示的判据（六轮审阅里「读失败被当成不存在」反复出现在
+ *      不同路径上）。→ storageRead 改为返回 { text, error }，原因随结果一起走，
+ *      模块级变量删除（10 个调用点全部改为解构）。
+ *   ② 【B4】「操作互斥」原有 3 套并行实现（withOpLock / applySnapshot 自己一套 /
+ *      rollbackApplyLog 自己一套），三套的闸、锁与返回值形状各不相同。
+ *      → 统一为唯一入口 withOpLock（新增 OP_LABELS 中文名映射与 label 参数），
+ *        applySnapshot 与 rollbackApplyLog 改为包在它里面并补齐返回值形状；
+ *        doRollback 与控制台入口不再自己 beginOp/endOp —— 否则是「自己把自己挡住」
+ *        （第二次 beginOp 必被拒，回档会永远返回 busy）。
+ *   本轮**不改对外行为**：与 v1.2.8 表现一致（427 项断言全绿；其中 4 条断言因
+ *   返回值形状与提示文案变化而同步更新，逐条判定为预期变更）。
  * ----------------------------------------------------------------------------
  * v1.2.8：第七轮 —— 换成「整体盲审」：三个互不通气的独立视角（冷读接手者 /
  *   文档对现实 / 对抗破坏者）通读全文，**不给它们我已知的问题清单**，以免框住视线；
@@ -312,7 +329,7 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.2.8";
+const MODULE_VERSION = "1.2.9";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
@@ -544,9 +561,13 @@ async function storageWrite(name, text) {
 //      原实现硬编码 "/modules/..."：服务器一旦配了路由前缀就必然 404，
 //      而 404 又被当成「还没有保存过快照」——用户看到的是错误的因果。
 //   ② 不再把一切失败都当「文件不存在」：只有 404 才是真的不存在，
-//      其余（HTTP 5xx / 断网）记进 storageLastError，让界面能说真话。
+//      其余（HTTP 5xx / 断网）由 storageRead 的 error 字段返回，让界面能说真话。
 //      返回语义仍然是 null（不给十几个调用点引入新的异常路径）。
-let storageLastError = null;
+// v1.2.9（S5）：原来这里有 `let storageLastError = null;` —— 已删除。
+// 读取失败的原因改由 storageRead 的返回值（error 字段）逐次携带：
+// 单变量会被同一次操作里后续的读取覆盖（读锁 → 读快照 → 读账本 → 读旧账本），
+// 「哪个文件读失败了」因此变得不可靠，而它正是多条错误提示的判据。
+
 // v1.2.4：回档账本的「读取失败」必须与「文件本来就不存在」分开，两个用途：
 //   ① 给用户看：读失败不能说成「本世界暂无可回档记录」（错误因果，会让人以为撤销点没了）；
 //   ② 给写路径用：读失败时绝不能照写覆盖 —— 账本里存的是「上一次恢复前的值」，
@@ -561,34 +582,35 @@ let legacyLogReadError = null;
 // 「原样另存成了哪个文件」。原来这两件事只在控制台里，界面上只说「暂无可回档记录」，
 // 用户会以为压根没有记录 —— 而撤销点很可能就躺在那份读不懂的文件里。
 let applyLogCorrupt = null;          // { reason: string, backup: string|null } 或 null
+// v1.2.9（S5）：返回值从「text 或 null，同时写模块级 storageLastError」改成结构化 { text, error }。
+// 原来「到底是哪个文件读失败了」只由一个全局变量承载，而一次操作会依次读锁文件、主快照、
+// 账本、旧账本……后一次读覆盖前一次，于是「404 清空 → 5xx 又写回」这类交错让上层很难说清
+// 谁出了问题（六轮审阅里「读失败被当成不存在」反复出现在不同路径）。把「读到什么」和
+// 「为什么没读到」一起返回，上层就不必再去猜一个全局变量的当前值。
 async function storageRead(name) {
   const url = foundry.utils.getRoute(norm(STORAGE_DIR) + "/" + name);
   let r;
   try {
     r = await fetch(url, { cache: "no-store" });
   } catch (e) {
-    storageLastError = "无法连接服务器（" + (e?.message || e) + "）";
     console.warn("[lh-world-sync] 读取失败：" + url, e);
-    return null;
+    return { text: null, error: "无法连接服务器（" + (e?.message || e) + "）" };
   }
-  if (r.status === 404) { storageLastError = null; return null; }
+  // 只有 404 才是「服务器明确说这个文件不存在」，其余失败都不能当成「没有」
+  if (r.status === 404) return { text: null, error: null };
   if (!r.ok) {
-    storageLastError = "服务器返回 HTTP " + r.status + "（" + name + "）";
     console.warn("[lh-world-sync] 读取失败：" + url + " → HTTP " + r.status);
-    return null;
+    return { text: null, error: "服务器返回 HTTP " + r.status + "（" + name + "）" };
   }
   // v1.2.4：读 body 必须包在 try 里。原来这行在函数内任何 try 之外，
   // 连接在「响应头已到、body 还没读完」时中断 → 异常直接逃到调用点；
   // 而 openRestoreConfirm 的首行、面板按钮回调都没有 catch，
   // 用户看到的现象是「点了没反应」（无提示、无日志）。
   try {
-    const text = await r.text();
-    storageLastError = null;
-    return text;
+    return { text: await r.text(), error: null };
   } catch (e) {
-    storageLastError = "读取响应内容失败（" + (e?.message || e) + "）";
     console.warn("[lh-world-sync] 读取响应失败：" + url, e);
-    return null;
+    return { text: null, error: "读取响应内容失败（" + (e?.message || e) + "）" };
   }
 }
 /* ---------- 权限与操作锁（v1.1.0） ---------- */
@@ -640,7 +662,7 @@ function endOp() { _opInFlight = null; _opInFlightAt = 0; }
 //   ③ TTL 2 分钟（v1.2.5 起），持有者崩溃/关页面后自动失效，不会留下死锁。
 async function acquireLock(opName) {
   const now = Date.now();
-  const text = await storageRead(LOCK_FILE);
+  const { text, error: lockReadErr } = await storageRead(LOCK_FILE);
   if (text) {
     try {
       const l = JSON.parse(text);
@@ -659,9 +681,9 @@ async function acquireLock(opName) {
         return { ok: false, holder: l, staleSelf: sameOwner && !samePage };
       }
     } catch (e) { /* 坏文件按无锁处理 */ }
-  } else if (storageLastError) {
+  } else if (lockReadErr) {
     // 读不到锁文件（5xx/断网）时按无锁放行，但必须留痕：这是「尽力而为的锁」
-    console.warn("[lh-world-sync] 锁文件读取异常，本次跳过互斥检查：" + storageLastError);
+    console.warn("[lh-world-sync] 锁文件读取异常，本次跳过互斥检查：" + lockReadErr);
   }
   const lock = {
     operationId: foundry.utils.randomID(),
@@ -688,7 +710,7 @@ async function acquireLock(opName) {
   // 于是 l2?.operationId（undefined）!== 自己的 → 自己刚写的锁把自己判成「别人的锁」，
   // 用户看到「已有进行中的世界同步操作（另一位 GM）」——注释写的是「不强求」，实现是反的。
   // 只有解析出「明确的、且不是自己的」operationId 才算真的被别人抢了锁。
-  const back = await storageRead(LOCK_FILE);
+  const { text: back } = await storageRead(LOCK_FILE);
   if (back) {
     try {
       const l2 = JSON.parse(back);
@@ -700,7 +722,7 @@ async function acquireLock(opName) {
 async function releaseLock(lock) {
   if (!lock?.operationId) return;
   try {
-    const text = await storageRead(LOCK_FILE);
+    const { text } = await storageRead(LOCK_FILE);
     const l = JSON.parse(text);
     if (l?.operationId === lock.operationId) {
       await storageWrite(LOCK_FILE, JSON.stringify({ ...l, releasedAt: new Date().toISOString(), expiresAt: 0 }, null, 2));
@@ -709,9 +731,16 @@ async function releaseLock(lock) {
 }
 // v1.2.1：让「存主世界 / 回档 / 导入设为主快照」与「恢复」共用同一把锁。
 // 拿不到锁时提示并返回 { locked: true }，调用方据此直接收手（别当成「无需执行」）。
-async function withOpLock(opName, fn) {
+// v1.2.9（B4）：opName → 中文名的映射表。原来写死 `opName === "snapshot" ? "存主快照" : opName`，
+// 别的操作一旦也走这里，提示里就会直接冒出英文 opName。
+const OP_LABELS = { snapshot: "存主快照", apply: "恢复主世界", rollback: "回档" };
+// v1.2.9（B4）：本函数是全模块**唯一**的互斥入口（会话闸 + 文件锁）。
+// v1.2.8 之前有三套并行实现（本函数 / applySnapshot 自己一套 / rollbackApplyLog 自己一套），
+// 三套的闸、锁与返回值形状各不相同 ——「改一处必漏另外两处」是本项目的稳定失效模式。
+async function withOpLock(opName, fn, label) {
+  const zh = label || OP_LABELS[opName] || opName;
   // v1.2.4：同会话重入闸（存主快照 / 导入设为主快照 这两条写路径）
-  if (!beginOp(opName === "snapshot" ? "存主快照" : opName)) return { busy: true };
+  if (!beginOp(zh)) return { busy: true };
   try {
     const got = await acquireLock(opName);
     if (!got.ok) {
@@ -720,12 +749,12 @@ async function withOpLock(opName, fn) {
       const when = h.startedAt ? formatTs(h.startedAt) : "";
       console.warn("[lh-world-sync] 操作被拒：已有进行中的世界同步操作", h);
       if (got.staleSelf) {
-        notify.warn("检测到你刚刷新过页面，而上一次操作的锁还留着（"
-          + escapeHtml(who) + (when ? " 于 " + when + " 开始" : "") + "）——它可能仍在服务器上继续执行。"
-          + "请等它结束（最多约 2 分钟）再操作，不要重复点击。");
+        // v1.2.8（A1）护栏 + v1.2.9 通用化：这条提示必须压得住「再点一次」的冲动。
+        notify.warn("检测到你刚刷新过页面，而上一次的「" + escapeHtml(zh) + "」可能还没有结束——它仍在服务器上继续执行。"
+          + "请先等它跑完（最长约 2 分钟），再操作。现在重复操作会让两次写入互相覆盖，撤销点会丢失。");
         return { locked: true, staleSelf: true };
       }
-      notify.warn(`已有进行中的世界同步操作（${escapeHtml(who)}${when ? " 于 " + when + " 开始" : ""}），请稍后再试。若对方已中断，约 2 分钟后会自动解锁。`);
+      notify.warn(`已有进行中的「${escapeHtml(zh)}」操作（${escapeHtml(who)}${when ? " 于 " + when + " 开始" : ""}），请稍后再试。若对方已中断，约 2 分钟后会自动解锁。`);
       return { locked: true };
     }
     try { return await fn(); } finally { await releaseLock(got.lock); }
@@ -739,9 +768,9 @@ async function withOpLock(opName, fn) {
 // 用户以为有退路（README 承诺过 .prev 文件），实际旧快照已被覆盖且没有任何副本。
 async function backupMasterSnapshot() {
   try {
-    const old = await storageRead(MASTER_FILE);
+    const { text: old, error: masterReadErr } = await storageRead(MASTER_FILE);
     if (!old) {
-      if (storageLastError) return { ok: false, reason: "readError", detail: storageLastError };
+      if (masterReadErr) return { ok: false, reason: "readError", detail: masterReadErr };
       return { ok: true, path: null };   // 确实没有旧快照，无需备份
     }
     const path = await storageWrite(MASTER_PREV_FILE, old);
@@ -975,10 +1004,10 @@ function contentTag(text) {
 // 兼容：新文件不存在时，从旧版合并账本 apply-log.json 里取本世界那一格
 // （只读不写；下次恢复会落到新文件，旧文件保持原样由用户自行删除）。
 async function readApplyLogStore() {
-  const text = await storageRead(applyLogFile());
-  // v1.2.4：读完立刻捕获本次读取的结果 —— 下面读旧版账本还会调用 storageRead，
-  // 而 storageLastError 是单变量、会被覆写，晚一步读就等于读错（拿到别人的结果）。
-  applyLogReadError = text ? null : storageLastError;
+  const { text, error: logReadErr } = await storageRead(applyLogFile());
+  // v1.2.4：读完立刻捕获本次读取的结果；v1.2.9（S5）起由返回值直接给出 ——
+  // 原来依赖的 storageLastError 是单变量，下面读旧账本时会被覆写，晚一步读就等于读错。
+  applyLogReadError = text ? null : logReadErr;
   // v1.2.7（第六轮盲审 G-2）：每次读取都先清掉上一次的旧值。
   // 原来 legacyLogReadError 只在「主账本读不到」的分支里被重设，主账本一旦读到
   // 就直接 return，于是上一轮遗留的旧错误一直留着，会把一次正常读取讲成「读取失败」。
@@ -1022,19 +1051,19 @@ async function readApplyLogStore() {
   }
   // v1.2.3：读不到文本时，区分「文件本来就没有」和「有文件但这次没读成」。
   // 后者若被当成空的，随后的写入会覆盖掉本世界原有的回档记录 —— 至少要留个痕。
-  if (storageLastError) {
-    console.warn("[lh-world-sync] 回档账本读取失败（" + storageLastError + "），"
+  if (logReadErr) {
+    console.warn("[lh-world-sync] 回档账本读取失败（" + logReadErr + "），"
       + "本次将重新写一份账本；若旧账本其实存在，它的回档记录会被覆盖。");
   }
-  const legacy = await storageRead(APPLOG_FILE_LEGACY);
+  const { text: legacy, error: legacyReadErr } = await storageRead(APPLOG_FILE_LEGACY);
   // v1.2.5：旧版合并账本读失败也要记下来 —— 否则这种情形会走「没有可回档记录」，
   // 而那个文件里可能还存着本世界的撤销点（与主账本读失败同类的错误因果）。
   // v1.2.6（第四轮盲审 S2）：旧账本读失败记进 legacyLogReadError，**不能**记进
   // applyLogReadError —— 后者是「写新账本会不会覆盖掉旧记录」的判据，而
   // apply-log.json 全文件只读不写（第 257 行声明，唯一读点就是上面这行）。
-  if (!legacy && storageLastError) {
-    legacyLogReadError = storageLastError;
-    console.warn("[lh-world-sync] 旧版合并账本 " + APPLOG_FILE_LEGACY + " 读取失败（" + storageLastError
+  if (!legacy && legacyReadErr) {
+    legacyLogReadError = legacyReadErr;
+    console.warn("[lh-world-sync] 旧版合并账本 " + APPLOG_FILE_LEGACY + " 读取失败（" + legacyReadErr
       + "）。它只用于查旧的回档记录，不影响本次恢复；若其中还存着本世界的撤销点，这次会看不到它。");
   } else {
     legacyLogReadError = null;
@@ -1249,32 +1278,10 @@ async function applySnapshot(snap, selection, precomputed) {
   // 让「用户看到的清单」与「实际写入的清单」是同一份，而不是各算一次。
   const diff = Array.isArray(precomputed) ? { changed: precomputed } : diffSnapshot(snap, selection);
   if (!diff.changed.length) return { applied: [], skipped: unavailable.length };
-  // v1.2.5：闸必须加在「拿锁之前」。
-  // v1.2.4 把它放在拿锁之后：beginOp 拒绝时直接 return，而那时文件锁已经写下、
-  // 又落在 try/finally 之外 → 锁无人释放，带着 2 分钟 TTL 把其他 GM / 标签页全挡住，
-  // 而实际并没有任何操作在跑（第三轮盲审判定为严重）。
-  if (!beginOp("恢复主世界")) return { applied: [], skipped: 0, busy: true };
-  let got = null;
-  try {
-    // 操作锁（审阅第 9 条）：另一个 GM 正在恢复时拒绝进入；TTL 到期自动失效
-    got = await acquireLock("apply");
-    if (!got.ok) {
-      const h = got.holder ?? {};
-      const who = h.userName || h.userId || "另一位 GM";
-      const when = h.startedAt ? formatTs(h.startedAt) : "";
-      console.warn("[lh-world-sync] 恢复被拒：已有进行中的恢复操作", h);
-      if (got.staleSelf) {
-        // v1.2.8（A1）：这条提示是本轮最重要的护栏之一。它出现时，
-        // 说明上一个页面的恢复很可能仍在服务器上跑（用户按了 F5）。
-        // 此时再点一次「恢复主世界」= 两个恢复并发写账本 = 撤销点被覆盖。
-        notify.warn("检测到你刚刷新过页面，而上一次的恢复可能还没有结束——它仍在服务器上继续执行。"
-          + "请先等它跑完（最长约 2 分钟；跑完后页面会提示「恢复完成」），再点恢复。"
-          + "现在重复点击会让两次恢复互相覆盖，上一次的撤销点会丢失。");
-        return { applied: [], skipped: 0, locked: true, staleSelf: true };
-      }
-      notify.warn(`已有进行中的恢复操作（${escapeHtml(who)}${when ? " 于 " + when + " 开始" : ""}），请稍后再试。若对方已中断，约 2 分钟后会自动解锁。`);
-      return { applied: [], skipped: 0, locked: true };
-    }
+  // v1.2.9（B4）：互斥（会话闸 + 文件锁）改走唯一入口 withOpLock。
+  // v1.2.5~v1.2.8 这里是第二套手写实现：自己的 beginOp、自己的 acquireLock、
+  // 自己的拒绝文案、自己的 try/finally —— 与 withOpLock、与回档路径各写一遍。
+  const r = await withOpLock("apply", async () => {
     const SettingDoc = settingDocumentClass();
     const currentMap = collectWorldSettings();
     // v1.2.5：顺序反转 —— 先算出「真正会写什么」，再记账、再写。
@@ -1378,14 +1385,11 @@ async function applySnapshot(snap, selection, precomputed) {
       notify.warn(describeUnavailable(unavailable));
     }
     return { applied: plan, skipped: unavailable.length, skippedKeys: unavailable };
-  } finally {
-    // v1.2.6（第四轮盲审 G5）：先释放文件锁，再放会话闸 —— 顺序不能反。
-    // v1.2.5 是反的：endOp() 一放闸，同标签页的下一个操作立刻可以开始（withOpLock 会写自己的锁），
-    // 而本函数随后的 releaseLock 是「读 → 判归属 → 写 expiresAt:0」的非原子序列；
-    // 它若读到新操作的锁、写却发生在对方写之后，就把别人的锁抹成了已释放，第三方 GM 可趁虚而入。
-    if (got?.lock) await releaseLock(got.lock);   // v1.2.5：没拿到锁就别瞎释放
-    endOp();                                      // v1.2.4：无论成败都放闸
-  }
+  }, "恢复主世界");
+  // v1.2.9（B4）：把 withOpLock 的 busy/locked 补成上层认识的样子 ——
+  // 上层 proceedApplySnap 会读 res.applied.length，形状不齐会变成 TypeError。
+  if (r?.busy || r?.locked) return { applied: [], skipped: 0, busy: r.busy, locked: r.locked, staleSelf: r.staleSelf };
+  return r;
 }
 // 回档：按 applyLog 恢复
 // v1.2.4：返回值不再「一律 null」。原来「非 GM / 读不到账本 / 被锁拒绝 / 账本属于
@@ -1413,18 +1417,10 @@ async function rollbackApplyLog() {
     console.warn("[lh-world-sync] 回档被拒：账本属于其他世界", log.worldId);
     return { foreign: true, worldId: log.worldId };
   }
-  const SettingDoc = settingDocumentClass();
-  // v1.2.1：回档同样是写操作，纳入同一把锁（原来只有恢复上锁）
-  const got = await acquireLock("rollback");
-  if (!got.ok) {
-    const h = got.holder ?? {};
-    const who = h.userName || h.userId || "另一位 GM";
-    const when = h.startedAt ? formatTs(h.startedAt) : "";
-    console.warn("[lh-world-sync] 回档被拒：已有进行中的世界同步操作", h);
-    notify.warn(`已有进行中的世界同步操作（${escapeHtml(who)}${when ? " 于 " + when + " 开始" : ""}），请稍后再试。若对方已中断，约 2 分钟后会自动解锁。`);
-    return { locked: true, holder: h };
-  }
-  try {
+  // v1.2.9（B4）：互斥改走唯一入口 withOpLock（原来这里是第三套手写实现）
+  const r = await withOpLock("rollback", async () => {
+    // v1.2.9：这行原来在函数顶部，随函数体一起移进锁内
+    const SettingDoc = settingDocumentClass();
     const keys = Object.keys(log.prev);
     // ① 先把「回档前的当前值」记下来 —— 后面的批量写入万一失败，用它还原
     const before = new Map();
@@ -1493,9 +1489,10 @@ async function rollbackApplyLog() {
       }
     }
     return { log, restored, untouched, changedCount: restored.length, untouchedCount: untouched.length };
-  } finally {
-    await releaseLock(got.lock);
-  }
+  }, "回档");
+  // v1.2.9（B4）：同上，补齐上层认识的形状
+  if (r?.busy || r?.locked) return { busy: r.busy, locked: r.locked, staleSelf: r.staleSelf };
+  return r;
 }
 
 /* ============================ 面板 HTML ============================ */
@@ -1874,7 +1871,9 @@ function openRollbackDialog() {
   })();
 }
 async function doRollback() {
-  if (!beginOp("回档")) return;              // v1.2.4：同会话重入闸
+  // v1.2.9（B4）：闸与锁统一由 rollbackApplyLog 内部的 withOpLock 负责。
+  // 这里若再来一次 beginOp，会变成「自己把自己挡住」—— 第二次 beginOp 必被拒，
+  // 于是回档永远返回 { busy: true }，用户看到的是「已有操作在进行」。
   try {
     const res = await rollbackApplyLog();
     // v1.2.4：四种「没回成」分别说清楚。原来一律弹「暂无可回档记录」，
@@ -1910,8 +1909,6 @@ async function doRollback() {
     notify.err(e?.__rollbackFailed
       ? "回档失败，且自动还原没能完成（世界可能停在中间状态）。请不要刷新页面，先看控制台错误。错误：" + (e?.message || e)
       : "回档失败，已自动还原到回档前的状态：" + (e?.message || e));
-  } finally {
-    endOp();                                  // v1.2.4：无论成败都放闸，别把闸卡死
   }
 }
 
@@ -2121,12 +2118,12 @@ function styleWindow($h) {
 // 读主快照 → 按面板勾选算差异 → 打开「恢复主世界 · 确认」弹窗
 // （主界面按钮与高级区「差异与恢复」共用这一条路径：先展示差异清单，再决定是否恢复）
 async function openRestoreConfirm($body) {
-  const text = await storageRead(MASTER_FILE);
+  const { text, error: readErr } = await storageRead(MASTER_FILE);
   if (!text) {
     // v1.2.2：区分「真的没有快照」与「读不到快照」—— 前者让用户去存，后者必须说真原因，
     // 否则服务器 5xx / 断网会被讲成「尚未保存主世界快照」，用户会去重复存快照。
-    notify.warn(storageLastError
-      ? "读取主世界快照失败：" + storageLastError + "。这不是「没有快照」，请检查服务器后重试。"
+    notify.warn(readErr
+      ? "读取主世界快照失败：" + readErr + "。这不是「没有快照」，请检查服务器后重试。"
       : "尚未保存主世界快照。请先点击「存主世界」，或从文件导入快照。");
     return;
   }
@@ -2170,7 +2167,7 @@ async function openSyncPanel() {
   // （审阅第 2 条：新世界恢复的核心场景，原实现看不到这些模块）
   const snapNs = new Set();
   try {
-    const text = await storageRead(MASTER_FILE);
+    const { text } = await storageRead(MASTER_FILE);
     // v1.2.6（第四轮盲审 G4）：先把缓存清掉再尝试解析。
     // v1.2.5 把首次刷新改成 refreshStatus(false) 复用缓存之后，解析失败（快照损坏 /
     // schema 不符 / 条目超限）会让 statusSnapCache 保留**上一次打开面板时的**快照，
@@ -2360,18 +2357,22 @@ async function openSyncPanel() {
       //    整份快照（本机实测 8.8MB）重新下载 + 同步解析一遍，只为刷新一行差异数。
       // ② 需要重读时先把缓存清空再读：原来 parseSnapshot 抛错时赋值语句根本不执行，
       //    上一次的旧快照会留在缓存里，之后不带参数刷新就拿旧基准算差异还显示得好好的。
+      // v1.2.9（S5）：本次读取的失败原因（读成功或 404 时为 null）
+      let statusReadError = null;
       if (snapOverride && typeof snapOverride === "object" && Array.isArray(snapOverride.settings)) {
         statusSnapCache = snapOverride;
       } else if (snapOverride || !statusSnapCache) {
         statusSnapCache = null;
-        const text = await storageRead(MASTER_FILE);
+        // v1.2.9（S5）：读取结果与失败原因一起拿到，不再依赖模块级单变量
+        const { text, error: readErr } = await storageRead(MASTER_FILE);
+        statusReadError = readErr;
         statusSnapCache = text ? parseSnapshot(text) : null;
       }
       const snap = statusSnapCache;
       if (!snap) {
         // v1.2.2：读不到 ≠ 没存过 —— 5xx / 断网时要说真原因，别误导用户去重复存快照
-        $s.html(storageLastError
-          ? `<span class="wsync-status-none">读取主世界基准失败：${escapeHtml(storageLastError)}</span>`
+        $s.html(statusReadError
+          ? `<span class="wsync-status-none">读取主世界基准失败：${escapeHtml(statusReadError)}</span>`
           : "<span class=\"wsync-status-none\">尚未保存主世界快照。请先在一个配置齐全的世界中点击「存主世界」。</span>");
         return;
       }
@@ -2415,15 +2416,15 @@ async function autoPromptCheck() {
   if (!game.settings.get(MODULE_ID, "autoPrompt")) return;
   // 刚应用过快照（刚刚刷新过页面）：跳过这一轮，不弹窗自问自答
   try { if (sessionStorage.getItem("wsync.justApplied")) { sessionStorage.removeItem("wsync.justApplied"); return; } } catch (e) {}
-  const text = await storageRead(MASTER_FILE);
+  const { text, error: readErr } = await storageRead(MASTER_FILE);
   if (!text) {
     // v1.2.2：读不到（5xx/断网）与「没存过」都会静默返回，但至少留个日志 ——
     // 否则用户会把「读失败」当成「没有差异」。
-    if (storageLastError) {
-      console.warn("[lh-world-sync] 自动提醒跳过：读取主快照失败 —— " + storageLastError);
+    if (readErr) {
+      console.warn("[lh-world-sync] 自动提醒跳过：读取主快照失败 —— " + readErr);
       // v1.2.4：不能一声不响。用户会把「没弹窗」理解成「没有差异」，
       // 而真实情况是这次根本没做成差异检查。面板路径早就说真话了，这里补上。
-      notify.warn("读取主世界基准失败，本次未做差异检查：" + storageLastError);
+      notify.warn("读取主世界基准失败，本次未做差异检查：" + readErr);
     }
     return;
   }
@@ -2559,10 +2560,7 @@ window.lhWorldSync = {
   parseSnapshot,
   diffSnapshot,
   applySnapshot,
-  rollback: async (...args) => {           // v1.2.5：控制台入口也要过会话闸（原来是裸函数）
-    if (!beginOp("回档")) return { busy: true };
-    try { return await rollbackApplyLog(...args); } finally { endOp(); }
-  },
+  rollback: rollbackApplyLog,              // v1.2.9（B4）：闸与锁都在函数内部统一处理
   readScopePref,
   buildSelection
 };
