@@ -1,5 +1,5 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.0.0 — 样式
+ * 世界同步装置 (lh-world-sync) v1.1.0 — 样式
  * 铁律参照：课程 CSS面板配置篇 / 教学视频库优化篇
  *   - 变量挂 .wsync-app[data-theme] 与 .wsync-themed（双保险）
  *   - .dialog-buttons 必须一并覆盖（窗口整体染色时底部标准按钮黑字黑底坑）
@@ -144,6 +144,9 @@
 
 /* ---------- 勾选区 ---------- */
 .wsync-sec-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
   color: var(--wsync-muted);
   margin: 8px 2px 4px;
@@ -341,3 +344,34 @@
 }
 .wsync-dl:hover { background: var(--wsync-surface); }
 .wsync-dl-tip { color: var(--wsync-muted); font-size: 11px; margin-left: 4px; }
+
+/* ---------- v1.1.0 新增：恢复范围提示 / 环境提示 / 小按钮 ---------- */
+.wsync-sec-title .wsync-btn-mini { margin-left: auto; }
+.wsync-btn-mini {
+  font-size: 11px;
+  padding: 2px 8px;
+  line-height: 1.6;
+  width: auto !important;
+}
+.wsync-scope-hint {
+  margin: 6px 2px 2px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--wsync-accent);
+  background: var(--wsync-surface);
+  border-radius: 0 4px 4px 0;
+  color: var(--wsync-muted);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+.wsync-scope-hint b { color: var(--wsync-accent); }
+.wsync-compat {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px dashed var(--wsync-accent2);
+  border-radius: 5px;
+  background: var(--wsync-surface);
+  color: var(--wsync-muted);
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+.wsync-compat b { color: var(--wsync-accent2); }
