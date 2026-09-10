@@ -1,5 +1,36 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.3.0
+ * 世界同步装置 (lh-world-sync) v1.3.1
+ * ----------------------------------------------------------------------------
+ * v1.3.1：第八轮「整体盲审」的第三视角（**对抗破坏者**：专门找「永久失去 /
+ *   写坏世界 / 永远卡住 / 假防护」）报出 12 条，加上「文档对现实」视角的核对，
+ *   按「会不会让你丢数据、会不会永久卡死」这条线筛出 8 处全部修掉；其余
+ *   （提示措辞、权限预检、公网暴露面、导入任意键…）记入审查档标「已知·不修」。
+ *   ① 【S1 · 本轮最危险】一次误点永久失去主快照：导入 →「设为主快照」这条路径
+ *      **完全没有覆盖前体检**（体检只写在「存主世界」按钮里），一份空快照就能把
+ *      8.8MB 基准换掉；之后在任意小世界点一次「存主世界」，唯一那份 .prev 也会
+ *      被覆盖成小的 —— 服务器上再无完整副本。→ 体检抽成 preflightMasterOverwrite()，
+ *      三条覆盖路径共用同一判据（自己读服务器上的主快照拿真实条目数，不看缓存）。
+ *   ② 【S2】体检原来依赖 statusSnapCache，读不到就 console.warn 一句后照常覆盖
+ *      （判据越不可用、越容易覆盖成功，与防手滑正好相反）→ 读不到即**拒绝覆盖**。
+ *   ③ 【S3】确认标志 snapshotForceAck 是「每页一次」：被警告后关掉面板、换个世界
+ *      再点，判据直接失效 → 改成 masterOverwriteAck 记录「已确认的那一份有多少项」，
+ *      换一份内容必须重新确认。
+ *   ④ 【S4】回档会删掉「你后来重新配置过的值」：账本记 present:false 的键，回档时
+ *      无条件 deleteDocuments —— 若恢复之后用户把它真正配起来了，这一删没有任何
+ *      副本（before 只在内存里，账本的 after 记的还是我们当初写进去的值）→ 现在
+ *      比对 after[key] 与当前值，不一致就**保留不动**，并在回档报告里单独列出来。
+ *   ⑤ 【S7】锁的到期时间只有读侧信任写侧时钟：expiresAt 由写锁那一方本机算出，
+ *      时钟快进 / 手工改锁文件 / 还原一份旧锁都可能塞进极大值 → 所有其他 GM 被
+ *      **永久拒绝**，而提示还写着「约 2 分钟后自动解锁」（假话）→ 读侧加
+ *      min(expiresAt, startedAt + 2×TTL) 上限。
+ *   ⑥ 【S5】锁文件读/写失败时**静默**跳过互斥：两个 GM 可同时恢复、各写各的账本、
+ *      撤销点互相覆盖，而界面上看不出任何异常 → 现在明确提示「本次未做互斥检查」。
+ *   ⑦ 【S12】写入失败的提示退化成符号：core 上传失败会 return {} / undefined /
+ *      false，原样拼进文案就是「快照写入失败:{}」—— 而这条路径正对应「磁盘已满 /
+ *      目录不可写 / 文件过大」→ 改成可读的原因描述。
+ *   ⑧ README：卸载模块（或手删模块文件夹）会连 storage 一起被 Foundry 递归删除
+ *      （出处 dist/packages/package.mjs 的 uninstall），主快照只有一代备份、
+ *      .prev 全模块只写不读 —— 这是「别把唯一副本留在服务器上」的前提，写明。
  * ----------------------------------------------------------------------------
  * v1.3.0：第七轮整体盲审剩下的 13 项一次收口 —— 导入体积上限 32MB（读之前校验）/
  *   快照拒收「始终排除键」/ 缺少稳定世界标识时拒绝写账本 / 回滚按本次真正创建的
@@ -335,7 +366,7 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.3.0";
+const MODULE_VERSION = "1.3.1";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
@@ -561,7 +592,17 @@ async function storageWrite(name, text) {
   }
   if (!res?.path) {
     storageDirReady = false;
-    throw new Error("快照写入失败:" + JSON.stringify(res));
+    // v1.3.1（第八轮对抗性审阅 S12）：core 的 FilePicker.upload 在上传失败时直接
+    // `return {}`（把服务端给的错误对象丢了，见 public/scripts/foundry.mjs:29476 与
+    // file-picker.mjs 的分支）、413 返回 undefined、response.error 时返回 false。
+    // 原来把这个返回值原样拼进提示，用户看到的是「快照写入失败:{}」——
+    // 而这条路径恰恰对应「磁盘满 / 目录不可写 / 文件过大」，正是最需要看懂的时刻。
+    const why = res === undefined
+      ? "文件过大，服务器拒绝了本次上传"
+      : res === false
+        ? "服务器返回了错误状态（详情见浏览器控制台）"
+        : "服务器没有返回文件路径（常见原因：磁盘已满、目录不可写、文件过大）";
+    throw new Error("快照写入失败：" + why + "（文件：storage/" + name + "）");
   }
   return res.path;
 }
@@ -660,10 +701,12 @@ let _opInFlightAt = 0;
 // 永久锁在门外，只有刷新页面能救 —— 而刷新又正好是 A1 那个坑的触发器。
 // 超过这个时长按「已中断」处理并放行（正常操作有 2 分钟锁 TTL 兜着，不会真的并发）。
 const OP_INFLIGHT_TTL_MS = 300000;
-// v1.2.8（A2）：「存主世界」覆盖前的二次确认标志。
-// 第一次点若发现当前世界设置数骤降（判据见存主世界按钮），只警告不执行；
-// 用户再点一次才真的覆盖 —— 这是主快照唯一的「防手滑」闸门。
-let snapshotForceAck = false;
+// v1.2.8（A2）：覆盖主快照前的二次确认标志（判据见 preflightMasterOverwrite）。
+// 第一次点若发现新配置比主快照小得多，只警告不执行；用户再点一次才真的覆盖。
+// v1.3.1（第八轮对抗性审阅 S3）：标志改成记录「已确认的那一份新内容的条目数」，
+// 不再是 true/false。原来只要警告过一次，标志就一直为真到下一次保存成功为止 ——
+// 用户被警告后关掉面板、换个世界再点，判据直接失效，等于根本没有确认过。
+let masterOverwriteAck = null;
 function beginOp(name) {
   if (_opInFlight) {
     const age = Date.now() - _opInFlightAt;
@@ -688,6 +731,13 @@ function endOp() { _opInFlight = null; _opInFlightAt = 0; }
 //   ③ TTL 2 分钟（v1.2.5 起），持有者崩溃/关页面后自动失效，不会留下死锁。
 async function acquireLock(opName) {
   const now = Date.now();
+  // v1.3.1（第八轮接手者审阅第 2 条）：锁的作用域必须与**被保护的资源**匹配。
+  // 主快照（world-snapshot-master.json）与它的 .prev 是模块目录下的**全局单文件**，
+  // 所有世界共用；而锁原来的判据只看 worldId —— 两个 DM 各开一个世界同时点「存主世界」，
+  // 两边 worldId 不同 → 双方都放行 → 都写同一个文件、都提示成功，可以造出
+  // 「主快照 = A 的内容、.prev = B 的内容」这种中间态，而 .prev 只有一代。
+  // 现在「存主世界 / 导入设为主快照」标为**全局锁**：只要任一方是全局操作，就不看 worldId。
+  const isGlobalOp = (opName === "snapshot");
   const { text, error: lockReadErr } = await storageRead(LOCK_FILE);
   if (text) {
     try {
@@ -700,7 +750,18 @@ async function acquireLock(opName) {
       // v1.2.8（第六轮整体盲审 A1）：同一会话还不够，必须同一页面。
       // 旧锁没有 pageToken 字段（v1.2.7 及以前写的）→ 按「同一页面」处理，向后兼容。
       const samePage = l?.pageToken ? (l.pageToken === myPageToken()) : true;
-      if (l?.expiresAt > now && l.worldId === currentWorldId() && !(sameOwner && samePage)) {
+      // v1.3.1（第八轮对抗性审阅 S7）：到期时间取「读侧上限」。
+      // expiresAt 是写锁那一方用**它自己的本机时钟**算出来的；时钟快进、手工编辑锁文件、
+      // 或从备份里还原一份旧锁，都可能塞进一个极大的值 —— 那会让所有其他 GM 被**永久拒绝**，
+      // 而提示还在说「约 2 分钟后会自动解锁」（假话）。用 startedAt + 2×TTL 兜一道上限。
+      const startedMs = Date.parse(l?.startedAt || "") || 0;
+      const hardCap = startedMs ? startedMs + 2 * LOCK_TTL_MS : 0;
+      const effExpires = hardCap
+        ? Math.min(Number(l?.expiresAt) || 0, hardCap)
+        : (Number(l?.expiresAt) || 0);
+      const lockScope = l?.scope || "world";       // 旧锁没有 scope 字段 → 按世界级处理
+      const crossWorldConflict = isGlobalOp || lockScope === "global";
+      if (effExpires > now && (crossWorldConflict || l.worldId === currentWorldId()) && !(sameOwner && samePage)) {
         // staleSelf：这把锁是自己这个会话、但上一个页面留下的 —— 上层据此给出
         // 「你刚刷新过，上一次操作可能还没结束」这种能解释清楚的提示，
         // 而不是含混地说「另一位 GM」。
@@ -708,12 +769,16 @@ async function acquireLock(opName) {
       }
     } catch (e) { /* 坏文件按无锁处理 */ }
   } else if (lockReadErr) {
-    // 读不到锁文件（5xx/断网）时按无锁放行，但必须留痕：这是「尽力而为的锁」
+    // 读不到锁文件（5xx/断网）时按无锁放行，但必须留痕：这是「尽力而为的锁」。
+    // v1.3.1（第八轮对抗性审阅 S5）：只留痕不够 —— 用户以为有互斥保护，实际这一轮没有。
+    // 两个 GM 同时恢复会各写各的账本、后写者覆盖前者的撤销点，而界面上看不出任何异常。
     console.warn("[lh-world-sync] 锁文件读取异常，本次跳过互斥检查：" + lockReadErr);
+    try { notify.warn("无法确认是否有其他人在操作（读取操作锁失败：" + escapeHtml(lockReadErr) + "）。本次未做互斥检查，请不要与他人同时操作。"); } catch (e) { /* 忽略 */ }
   }
   const lock = {
     operationId: foundry.utils.randomID(),
     op: opName,
+    scope: isGlobalOp ? "global" : "world",   // v1.3.1：全局资源（主快照）与世界资源（本世界设置）分开
     worldId: currentWorldId(),
     worldTitle: game.world?.title ?? "",
     userId: game.user.id,
@@ -730,6 +795,7 @@ async function acquireLock(opName) {
     await storageWrite(LOCK_FILE, JSON.stringify(lock, null, 2));
   } catch (e) {
     console.warn("[lh-world-sync] 锁文件写入失败，本次跳过互斥检查继续执行：" + (e?.message || e));
+    try { notify.warn("无法写入操作锁，本次未做互斥检查，请不要与他人同时操作。"); } catch (e2) { /* 忽略 */ }
     return { ok: true, lock: null };
   }
   // v1.2.4：回读不可用时必须放行。JSON.parse(null) 不抛错、返回 null，
@@ -805,6 +871,41 @@ async function backupMasterSnapshot() {
     console.warn("[lh-world-sync] 主快照备份失败", e);
     return { ok: false, reason: "writeError", detail: (e?.message || String(e)) };
   }
+}
+// v1.3.1（第八轮对抗性审阅 S1 / S2 / S3）：覆盖主快照前的「内容体检」，
+// 抽成函数让**三条覆盖路径共用同一判据**（存主世界 / 导入 → 设为主快照）。
+// 原来这段只写在「存主世界」按钮里，于是：
+//   ① 导入 →「设为主快照」这条路径**完全没有体检** —— 一份空快照就能把 8.8MB 的
+//      主快照换掉，之后再在任意小世界点一次「存主世界」，连唯一那份 .prev 也被覆盖，
+//      而 UI 还在说「上一份已备份为 X」（.prev 全模块只写不读，救不回来）；
+//   ② 体检依赖 statusSnapCache，读不到就 console.warn 一句后照常覆盖；
+//   ③ 确认标志是「每页一次」，被警告后关面板再点就失效。
+// 现在：自己读一次服务器上的主快照拿**真实**条目数（不依赖任何缓存），读不到就拒绝覆盖；
+// 确认只对「同一份新内容的条目数」生效，换一份内容要重新确认。
+const MASTER_MIN_ITEMS = 20;        // 少于这么多项：不可能是完整的主世界配置
+const MASTER_SHRINK_RATIO = 0.3;    // 只剩不到三成：典型的「选错了世界」
+async function preflightMasterOverwrite(newCount, label) {
+  const zh = label || "覆盖主快照";
+  let oldCount = 0;
+  try {
+    const { text, error } = await storageRead(MASTER_FILE);
+    if (error) return { ok: false, reason: "readError", detail: error };
+    if (text) {
+      const old = parseSnapshot(text);
+      oldCount = Array.isArray(old?.settings) ? old.settings.length : 0;
+    }
+  } catch (e) {
+    // 主快照存在但内容不合法（结构不符 / 条目超限）：同样不能当成「没有旧快照」，
+    // 否则就是在一份读不懂的基准上直接覆盖。
+    return { ok: false, reason: "readError", detail: (e?.message || String(e)) };
+  }
+  if (!oldCount || newCount >= oldCount) return { ok: true, oldCount };
+  if (masterOverwriteAck === newCount) { masterOverwriteAck = null; return { ok: true, oldCount, forced: true }; }
+  if (newCount < MASTER_MIN_ITEMS || newCount < oldCount * MASTER_SHRINK_RATIO) {
+    masterOverwriteAck = newCount;
+    return { ok: false, reason: "tooSmall", oldCount, newCount, label: zh };
+  }
+  return { ok: true, oldCount };
 }
 
 /* ---------- 世界设置全集读写 ---------- */
@@ -1268,16 +1369,27 @@ function formatTs(iso) {
 // 主快照可能来自「当时没启用本模块」的世界（例如别人服务器导出的文件），
 // 整体覆盖之后刷新页面，本模块自己就没了 —— 用户只能去「管理模组」里手工找回。
 let _selfKeepWarned = false;
-function keepSelfEnabled(key, val) {
+function keepSelfEnabled(key, val, currentValue) {
   if (key !== "core.moduleConfiguration") return val;
   if (!val || typeof val !== "object" || Array.isArray(val)) return val;
-  if (val[MODULE_ID] === true) return val;
+  // v1.3.1（第八轮接手者审阅第 1 条）：从「整体覆盖」改成「合并写入」。
+  // Foundry 判断一个模组要不要加载用的是 moduleConfiguration[模组id] === true
+  // （出处：dist/server/views/view.mjs 的 _getStaticContent 只注入严格为 true 的模组；
+  //   dist/packages/world.mjs 发世界数据时 `e.active = l[e.id] ?? false`），
+  // 因此**缺键就等于把这个模组关掉**。原来整串覆盖的含义是：快照来自「当时没装 M 的
+  // 世界」时，恢复进装着 M 的世界会让 M 的键消失 → 刷新后 M 静默失效，
+  // 而界面报告的是「同步成功」。现在以**当前世界的值打底**，只覆盖快照里显式存在的键：
+  // 快照没有记录到的模组保持它现在的开关状态。
+  // 第三参缺省时不合并（差异检测路径保持原样，避免把「合并后的值」当成基准去报差异）。
+  const cur = (currentValue && typeof currentValue === "object" && !Array.isArray(currentValue)) ? currentValue : null;
+  const merged = cur ? { ...cur, ...val } : val;
+  if (merged[MODULE_ID] === true) return cur ? merged : val;
   // v1.2.3：收到「只看不写」的调用（diffSnapshot 每次进世界都跑）也不刷屏，只提示一次
   if (!_selfKeepWarned) {
     _selfKeepWarned = true;
     console.warn("[lh-world-sync] 快照的模组启用列表里没有本模块，已强制保留为启用：" + MODULE_ID);
   }
-  return { ...val, [MODULE_ID]: true };
+  return { ...merged, [MODULE_ID]: true };
 }
 // v1.2.5：本机「有没有这个设置键所属的模组」。
 // 恢复时这些键会被跳过（不创建没人读、却会随快照在服务器之间复制的悬空键），
@@ -1368,7 +1480,7 @@ async function applySnapshot(snap, selection, precomputed) {
       // v1.2.4：一律用 getSettingDoc（与回档、回档还原路径同一规则）—— 两套查找规则
       // 在存在重复文档时会让「写入」与「还原」落在两份不同的文档上。
       const doc = getSettingDoc(c.key);
-      const json = JSON.stringify(keepSelfEnabled(c.key, c.to));
+      const json = JSON.stringify(keepSelfEnabled(c.key, c.to, currentMap.get(c.key)?.value));
       if (doc?._id) {
         updates.push({ _id: doc._id, value: json });
         plan.push(c);
@@ -1392,7 +1504,9 @@ async function applySnapshot(snap, selection, precomputed) {
       // v1.2.3：账本里记的必须是「实际写进去的值」，不是「想要写的值」。
       // 写入时 moduleConfiguration 会经 keepSelfEnabled 补上本模块自己，
       // 账本若还记原值，findDriftedKeys 会拿原值跟当前值比 → 误报「你又改过」。
-      afterMap.set(c.key, keepSelfEnabled(c.key, c.to));
+      // v1.3.1：记的必须是实际写入的值 —— 合并写入后 moduleConfiguration 可能是
+      // 「当前值 ∪ 快照值」，与 c.to 不再相同（v1.2.3 的老教训在此重演一次）。
+      afterMap.set(c.key, keepSelfEnabled(c.key, c.to, currentMap.get(c.key)?.value));
     }
     // 写账本（任何写入之前；失败=直接报错，未动任何设置）
     let logOpId = null;
@@ -1476,7 +1590,8 @@ async function applySnapshot(snap, selection, precomputed) {
 // 把「被别人锁着」「读失败」「不是这个世界的账本」全都讲成了「你没有记录」。
 async function rollbackApplyLog() {
   if (!assertGM()) return { denied: true };                   // assertGM 已提示过
-  const log = await readApplyLog();
+  // v1.3.1（第八轮接手者审阅第 3 条）：改成 let —— 进锁后要重读并可能替换它
+  let log = await readApplyLog();
   // v1.2.6（第四轮盲审 S1）：主账本读失败时**一律不许回档**，哪怕从旧版合并账本里凑出了条目。
   // 那份数据可能已经过期（本世界的账本更新过、这次没读到），拿它批量覆盖世界 = 用旧值抹掉新值；
   // 随后的 markLogRolledBack 还会把主账本里更新的那条标成「已回档」，撤销点语义被污染。
@@ -1498,22 +1613,51 @@ async function rollbackApplyLog() {
   }
   // v1.2.9（B4）：互斥改走唯一入口 withOpLock（原来这里是第三套手写实现）
   const r = await withOpLock("rollback", async () => {
+    // v1.3.1（第八轮接手者审阅第 3 条）：账本原来在**锁外**读、锁内用。
+    // 从「读到账本」到「拿到锁」之间，另一个 GM（或刷新后的另一个标签页）完全可能
+    // 完成一次「恢复主世界」—— 主账本已经换成新的 prev/after，而本流程仍按**旧账本**
+    // 批量覆盖世界（用旧值抹掉更近的值），随后的 markLogRolledBack 还会把**新账本**
+    // 标成「已回档过」：用户唯一的撤销点被标成用过的。
+    // 现在进锁后重读一次，并核对 opId 是否仍是同一条记录。
+    const fresh = await readApplyLog();
+    if (applyLogReadError) return { readError: applyLogReadError };
+    if (fresh?.prev) {
+      if (log?.opId && fresh.opId && String(fresh.opId) !== String(log.opId)) {
+        console.warn("[lh-world-sync] 回档被拒：等待锁期间账本已被另一次操作替换", log.opId, fresh.opId);
+        return { stale: true };
+      }
+      log = fresh;
+    }
     // v1.2.9：这行原来在函数顶部，随函数体一起移进锁内
     const SettingDoc = settingDocumentClass();
     const keys = Object.keys(log.prev);
     // ① 先把「回档前的当前值」记下来 —— 后面的批量写入万一失败，用它还原
     const before = new Map();
     const updates = [], creates = [], deletes = [];
+    // v1.3.1（第八轮对抗性审阅 S4）：别把「你后来重新配置的值」一起删掉。
+    // 账本记 present:false = 那次恢复时这个键本来不存在（是恢复过程创建的）。
+    // 但恢复之后用户可能真的把它配起来了 —— 此时它的值已经不等于我们当初写进去的值。
+    // 原来无条件 deleteDocuments，等于把用户后来配好的东西删掉，而且没有任何副本
+    // （before 只在内存里，账本的 after[key] 记的还是我们当初写的那个值）。
+    const keptDrift = [];
+    const afterMap = (log.after && typeof log.after === "object" && !Array.isArray(log.after)) ? log.after : null;
     for (const key of keys) {
       const p = log.prev[key];
       const doc = getSettingDoc(key);
       before.set(key, { present: !!doc?._id, value: doc?.value });
       if (!p.present) {
-        if (doc?._id) deletes.push(doc._id);
+        if (doc?._id) {
+          const hasWritten = afterMap && Object.prototype.hasOwnProperty.call(afterMap, key);
+          if (hasWritten && !isJSONEqual(doc.value ?? null, afterMap[key] ?? null)) {
+            keptDrift.push({ key, current: doc.value });
+            continue;   // 保留，不动它
+          }
+          deletes.push(doc._id);
+        }
       } else {
         // v1.2.3：回档写回模组启用列表时同样强制保留本模块，
         // 否则「账本里本模块是关的」这种极端情况下，回档会把模块自己关掉。
-        const json = JSON.stringify(keepSelfEnabled(key, p.value));
+        const json = JSON.stringify(keepSelfEnabled(key, p.value, before.get(key)?.value));
         if (doc?._id) updates.push({ _id: doc._id, value: json });
         else creates.push({ key, user: null, value: json });
       }
@@ -1545,7 +1689,7 @@ async function rollbackApplyLog() {
           if (newId) d2.push(newId);
           else if (doc?._id) d2.push(doc._id);
         } else {
-          const json = JSON.stringify(keepSelfEnabled(key, b.value));
+          const json = JSON.stringify(keepSelfEnabled(key, b.value, doc?.value));
           if (doc?._id) u2.push({ _id: doc._id, value: json });
           else c2.push({ key, user: null, value: json });
         }
@@ -1568,17 +1712,21 @@ async function rollbackApplyLog() {
     // v1.2.2：把「真的动过」和「本来就没这项、什么都没做」分成两笔账 ——
     // 原来两者都算进「已回档 N 项」，还配一句「已全部还原」，属于虚报。
     const restored = [], untouched = [];
+    const keptKeys = new Set(keptDrift.map(k => k.key));
     for (const key of keys) {
       const p = log.prev[key];
       const b = before.get(key);
       if (!p.present) {
+        // v1.3.1（S4）：被保留的项单独走 keptDrift，不混进 untouched 的计数
+        // （否则报告会说「本来就不存在」，与实际原因不符）。
+        if (keptKeys.has(key)) continue;
         if (b?.present) restored.push({ key, action: "删除（恢复为键不存在）", value: undefined });
         else untouched.push({ key, action: "本就不存在（无需处理）", value: undefined });
       } else {
         restored.push({ key, action: "恢复", value: p.value });
       }
     }
-    return { log, restored, untouched, changedCount: restored.length, untouchedCount: untouched.length };
+    return { log, restored, untouched, keptDrift, changedCount: restored.length, untouchedCount: untouched.length };
   }, "回档");
   // v1.2.9（B4）：同上，补齐上层认识的形状
   if (r?.busy || r?.locked) return { busy: r.busy, locked: r.locked, staleSelf: r.staleSelf };
@@ -1987,12 +2135,22 @@ async function doRollback() {
         + " ——这不是「没有记录」：账本文件可能还在服务器上，请检查服务器连接后重试。");
       return;
     }
+    // v1.3.1：等锁期间账本被别的操作换掉了 —— 不能用旧记录覆盖世界
+    if (res?.stale) {
+      notify.warn("在你等待期间，「回档记录」已经被另一次操作更新了。为避免用过期数据覆盖世界，本次回档已取消。请重新打开「回档」查看最新记录。");
+      return;
+    }
     if (res?.foreign) { notify.warn("本世界没有可回档的记录（读到的是其他世界的账本）。"); return; }
     if (!res || res.empty) { notify.warn("暂无可回档记录。"); return; }
     // v1.2.2：清单把「真的动过的」和「本来就不存在、没动的」分开，数字不再混为一谈。
     const shown = res.restored.length ? res.restored : res.untouched;
     const lines = shown.slice(0, 150).map(r => `<div class="wsync-diff-row"><code>${escapeHtml(r.key)}</code><span class="wsync-diff-tag">${escapeHtml(r.action)}</span></div>`).join("");
     const trimmed = shown.length > 150 ? `<div class="wsync-diff-more">…还有 ${shown.length - 150} 项</div>` : "";
+    // v1.3.1（第八轮对抗性审阅 S4）：被保留的项必须单独报出来 —— 它们是本次回档
+    // **故意没动**的东西（回档之后又被重新配置过），不说清楚用户会以为回档没做干净。
+    const keptNote = (res.keptDrift?.length)
+      ? `<div class="wsync-diff-more">另有 <b>${res.keptDrift.length}</b> 项是你在这次恢复之后又改过的（${escapeHtml(res.keptDrift.slice(0, 3).map(k => k.key).join("、"))}${res.keptDrift.length > 3 ? " 等" : ""}），已<b>原样保留</b>——回档没有把它们删掉。</div>`
+      : "";
     const skippedNote = res.untouchedCount
       ? `另有 ${res.untouchedCount} 项在本世界本来就不存在，未做任何操作。`
       : "";
@@ -2001,7 +2159,7 @@ async function doRollback() {
       : `上次恢复涉及的设置在本世界已经不存在，无需回档。`;
     new Dialog({
       title: "回档完成 · 恢复了什么",
-      content: `<div class="wsync-body"><div class="wsync-diff-summary">${head}</div>${lines}${trimmed}</div>`,
+      content: `<div class="wsync-body"><div class="wsync-diff-summary">${head}</div>${keptNote}${lines}${trimmed}</div>`,
       buttons: { close: { icon: "<i class=\"fa-solid fa-xmark\"></i>", label: "关闭", callback: () => {} } },
       render: ($h) => styleWindow($h)
     }, { classes: ["dialog", "wsync-app"], width: 640 }).render(true);
@@ -2160,7 +2318,14 @@ async function openSnapImportDialog(snap) {
         if (!assertGM()) return;
         try {
           let aborted = null;
+          let preflight = null;
           const r = await withOpLock("snapshot", async () => {
+            // v1.3.1（第八轮对抗性审阅 S1）：这条路径原来**没有**覆盖前体检 ——
+            // 导入一份空快照（settings 允许是空数组）就能把 8.8MB 的主快照换掉；
+            // 之后在任意小世界点一次「存主世界」，连唯一那份 .prev 也会被覆盖成小的，
+            // 而通知还在说「上一份已备份为 X」。现在与「存主世界」共用同一条判据。
+            preflight = await preflightMasterOverwrite(n, "设为主快照");
+            if (!preflight.ok) return null;
             // v1.2.1：同样先备份旧主快照（自查第 14 项）
             // v1.2.4：备份没做成就不覆盖 —— 原来备份失败只是静默跳过，
             // 而通知照样说「已设为主快照」，用户以为有退路，实际旧快照已被覆盖且无副本。
@@ -2170,6 +2335,17 @@ async function openSnapImportDialog(snap) {
             return { backed: backed.path };
           });
           if (r?.locked || r?.busy) return;
+          if (preflight && !preflight.ok) {
+            if (preflight.reason === "tooSmall") {
+              notify.warn("警告：这份快照只有 " + preflight.newCount + " 项，而服务器上的主快照有 " + preflight.oldCount
+                + " 项 —— 拿它当基准，以后所有世界都会恢复成这一小份配置。已暂停。"
+                + "若确认要用它当主快照，请再点一次「设为主快照」；否则请先确认你导入的是对的文件。");
+            } else {
+              notify.err("未能读取服务器上的现有主快照（" + escapeHtml(preflight.detail || "") + "），无法确认这次替换会不会丢掉配置。"
+                + "为避免在没有退路的情况下覆盖，本次「设为主快照」已取消。请检查服务器后重试。");
+            }
+            return;
+          }
           if (aborted) {
             notify.err(aborted.reason === "readError"
               ? "未能读取现有主快照（" + aborted.detail + "），无法确认备份是否成功。为避免在没有退路的情况下覆盖，本次「设为主快照」已取消。请检查服务器后重试。"
@@ -2282,7 +2458,15 @@ async function openSyncPanel() {
   // （审阅第 2 条：新世界恢复的核心场景，原实现看不到这些模块）
   const snapNs = new Set();
   try {
-    const { text } = await storageRead(MASTER_FILE);
+    const { text, error: panelReadErr } = await storageRead(MASTER_FILE);
+    // v1.3.1（第八轮接手者审阅第 5 条）：读不到主快照时必须说出来。
+    // storageRead 对 5xx / 断网**不抛异常**（只返回 {text:null,error}），所以下面那个
+    // catch 根本不会执行 —— 原来这里只解构 text、丢掉 error，于是下面的模块勾选列表
+    // 静默退化成「只有当前世界已有的模块」（而「快照里有、本世界还没写过设置」的模块
+    // 正是新世界恢复的核心场景），用户可能就此保存一个残缺的恢复范围。
+    if (!text && panelReadErr) {
+      notify.warn("这次没能读到服务器上的主世界基准（" + escapeHtml(panelReadErr) + "），下面的模块列表可能不完整，请勿据此保存恢复范围。");
+    }
     // v1.2.6（第四轮盲审 G4）：先把缓存清掉再尝试解析。
     // v1.2.5 把首次刷新改成 refreshStatus(false) 复用缓存之后，解析失败（快照损坏 /
     // schema 不符 / 条目超限）会让 statusSnapCache 保留**上一次打开面板时的**快照，
@@ -2318,24 +2502,29 @@ async function openSyncPanel() {
         // 先警告并要求再点一次确认。
         try {
           const nNow = collectWorldSettings().size;
-          const nMaster = Array.isArray(statusSnapCache?.settings) ? statusSnapCache.settings.length : null;
           if (nNow === 0) {
             notify.err("当前世界没有任何设置可以保存，已取消（避免用空快照覆盖服务器上的完整主快照）。");
             return;
           }
-          if (nMaster === null) {
-            console.warn("[lh-world-sync] 未读到服务器现有主快照的条目数，本次跳过「覆盖前体检」。");
-          } else if (nNow < nMaster * 0.3 && nNow < nMaster - 10 && !snapshotForceAck) {
-            snapshotForceAck = true;
-            notify.warn("警告：当前世界只有 " + nNow + " 项设置，而服务器上的主快照有 " + nMaster
-              + " 项 —— 这通常说明你选错了世界。已暂停保存。"
-              + "若确认要用这份覆盖主快照，请再点一次「存主世界」；否则请切回原来的世界。");
+          // v1.3.1：体检改走共用函数（自己读服务器上的主快照拿真实条目数，不依赖 statusSnapCache）。
+          const pf = await preflightMasterOverwrite(nNow, "存主世界");
+          if (!pf.ok) {
+            if (pf.reason === "tooSmall") {
+              notify.warn("警告：当前世界只有 " + pf.newCount + " 项设置，而服务器上的主快照有 " + pf.oldCount
+                + " 项 —— 这通常说明你选错了世界。已暂停保存。"
+                + "若确认要用这份覆盖主快照，请再点一次「存主世界」；否则请切回原来的世界。");
+            } else {
+              notify.err("未能读取服务器上的主快照（" + escapeHtml(pf.detail || "") + "），无法确认这次覆盖会不会把完整配置换成残缺的一份。"
+                + "为避免在没有退路的情况下覆盖，本次保存已取消。请检查服务器后重试。");
+            }
             return;
-          } else {
-            snapshotForceAck = false;
           }
         } catch (e) {
-          console.warn("[lh-world-sync] 覆盖前体检出错，本次跳过：", e);
+          // v1.3.1：体检本身出错时**不再跳过**。原来 catch 里 console.warn 一句就继续覆盖，
+          // 等于「判据越不可用、越容易覆盖成功」，与防手滑的目的正好相反。
+          console.error("[lh-world-sync] 覆盖前体检出错，为安全起见取消本次保存：", e);
+          notify.err("覆盖前的内容检查没能完成（" + escapeHtml(e?.message || String(e)) + "），为安全起见本次保存已取消。请稍后重试。");
+          return;
         }
         try {
           const r = await withOpLock("snapshot", async () => {
@@ -2356,7 +2545,7 @@ async function openSyncPanel() {
               : "备份现有主快照失败（" + bf.detail + "）。为避免在没有退路的情况下覆盖，本次保存已取消。");
             return;
           }
-          snapshotForceAck = false;   // v1.2.8：确认标志用完即清，避免影响下一次保存
+          masterOverwriteAck = null;   // v1.3.1：保存成功后清掉确认标志（判据见 preflightMasterOverwrite）
           notify.ok(`已保存主世界快照：${r.count} 项设置（${r.path}）`
             + (r.backed ? `；上一份已备份为 ${r.backed}` : "；此前没有旧主快照，无需备份"));
           refreshStatus(r.snap);
@@ -2680,7 +2869,18 @@ Hooks.on("ready", () => {
 // 但把 applySnapshot / rollback 直接摆在玩家端的全局对象里，等于给「绕过 UI 直接调」
 // 留了一个显眼入口 —— 不构成漏洞，但没有理由摆在那里。
 const _readonlyApi = { version: MODULE_VERSION, openPanel: openSyncPanel, buildSnapshot, parseSnapshot, diffSnapshot, readScopePref, buildSelection };
-window.lhWorldSync = game.user?.isGM
-  ? { ..._readonlyApi, applySnapshot, rollback: rollbackApplyLog }
-  : _readonlyApi;
-console.log(`lh-world-sync v${MODULE_VERSION} loaded (window.__WSYNC_VER=${window.__WSYNC_VER})`);
+// v1.3.1（第八轮接手者审阅第 6 条）：原来这段在**模块顶层**求值，而 `game` 只在
+// Foundry 的 DOMContentLoaded 回调里创建 —— 出处 public/scripts/foundry.mjs:181079-181097
+// `window.addEventListener("DOMContentLoaded", async () => { … globalThis.game = await Game.create(…) })`；
+// 模组脚本又是 `<script type="module">`（templates/views/layouts/main.html:28 一带同理）
+// = defer 语义、执行在 DOMContentLoaded **之前** → 顶层读 `game.user` 抛 ReferenceError，
+// 于是 window.lhWorldSync 从来就没有被挂上过（README 却把它当既有入口写着）。
+// 现在挪进 ready：那一刻 game 一定存在。
+Hooks.once("ready", () => {
+  try {
+    window.lhWorldSync = game.user?.isGM
+      ? { ..._readonlyApi, applySnapshot, rollback: rollbackApplyLog }
+      : _readonlyApi;
+  } catch (e) { console.error("[lh-world-sync] 控制台接口挂载失败", e); }
+  console.log(`lh-world-sync v${MODULE_VERSION} loaded (window.__WSYNC_VER=${window.__WSYNC_VER})`);
+});
