@@ -27,7 +27,7 @@ https://raw.githubusercontent.com/Ryuka16/lh-world-sync/main/module.json
 | 恢复主世界 | 将当前世界恢复为基准快照的状态：设置与**模组启用状态**一并恢复，完成后页面自动刷新 |
 | 自动提醒 | GM 进入世界时若发现有差异，自动弹窗询问：**恢复主世界 / 暂不恢复 / 不再自动提醒**（可随时改回） |
 | 查看差异 | 恢复前列出差异清单：每一项显示「当前值 → 基准值」，并标注 **→开启 / →关闭 / →修改** |
-| 回档 | 每次恢复前自动记账，回档＝按账本精确还原上一次恢复改动的设置；此后手动调整的其他设置不受影响 |
+| 回档 | 每次恢复前自动记账，回档＝按账本精确还原上一次恢复改动的设置；此后手动调整的其他设置不受影响。**回档记录按世界分开保存**，多个世界各留各的，不会互相覆盖 |
 | 快照文件 | 快照可**导出下载 / 复制全文 / 从文件导入 / 粘贴导入**，用于跨服务器迁移 |
 | 恢复范围 | 在「高级选项」中可按模块勾选恢复范围（默认全部恢复），配置一次即可 |
 | 主题 | 深空蓝 / 蓝白 / 琉璃绿 / 鎏金 / 薄荷 五种配色，每位用户可自行选择（client 级设置） |
@@ -53,7 +53,7 @@ https://raw.githubusercontent.com/Ryuka16/lh-world-sync/main/module.json
 {
   "schema": 1,
   "app": "lh-world-sync",
-  "appVersion": "1.0.8",
+  "appVersion": "1.0.9",
   "sourceWorld": "主世界名",
   "savedAt": "ISO 时间",
   "systemId": "dnd5e",
@@ -64,6 +64,30 @@ https://raw.githubusercontent.com/Ryuka16/lh-world-sync/main/module.json
 }
 ```
 
+## 回档账本格式 (schema 2)
+
+回档记录与快照同目录，存在 `apply-log.json` 中，**按世界分区**——多个世界各留各的，互不覆盖：
+
+```json
+{
+  "schema": 2,
+  "worlds": {
+    "<worldId>": {
+      "ts": "ISO 时间",
+      "worldId": "<worldId>",
+      "worldTitle": "世界显示名",
+      "appVersion": "1.0.9",
+      "prev": { "<设置键>": { "present": true, "value": "…恢复前的值…" } }
+    }
+  }
+}
+```
+
+- `worldId` 取 `game.world.id`，世界改名不影响归属
+- `prev` 只记录「上一次恢复实际改动过的键」；`present: false` 表示该键当时并不存在（回档时把它删掉）
+- 回档只认当前世界的那一格：读不到就提示「暂无可回档记录」，**绝不会拿别的世界的旧值回填**
+- 旧版账本（无世界分区的单条格式）不再作为回档依据——宁可少一次回档，也不乱写
+
 ## 边界与安全（设计决策）
 
 - **同步范围为 world 级设置**；client 级设置（浏览器本地偏好）不在同步范围内。玩家账号无需同步——同一服务器的所有世界共享用户列表。
@@ -71,7 +95,7 @@ https://raw.githubusercontent.com/Ryuka16/lh-world-sync/main/module.json
 - **模组启用状态**（`core.moduleConfiguration`）默认包含在恢复范围内：此前被关闭的模组会随主世界重新启用。恢复后页面自动刷新，无需手动操作。
 - **恢复前先记账、失败自动回滚**：批量写入失败时会按账本还原，不会写入一半。
 - **恢复完成后 3 秒自动刷新页面**（模组启用状态需刷新页面才生效）。如需撤销，刷新完成后点击「回档」即可。
-- **Foundry 未提供游戏内文件删除 API**：快照与账本均为固定文件名覆盖写入（`world-snapshot-master.json` / `apply-log.json`），不会累积文件；如需清空，可在服务器 `Data/modules/lh-world-sync/storage/` 中手动删除。
+- **Foundry 未提供游戏内文件删除 API**：快照与账本均为固定文件名覆盖写入（`world-snapshot-master.json` / `apply-log.json`），不会累积文件；账本自 v1.0.9 起按世界分区存放在同一个文件里（旧版的单条账本会被忽略，不再用于回档）。如需清空，可在服务器 `Data/modules/lh-world-sync/storage/` 中手动删除。
 
 ## 授权
 

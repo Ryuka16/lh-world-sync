@@ -1,7 +1,19 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.0.8
+ * 世界同步装置 (lh-world-sync) v1.0.9
  * ----------------------------------------------------------------------------
  * 功能：把一个世界当作「主世界」保存配置快照；新世界一键读回。
+ * v1.0.9：修复「回档账本跨世界串数据」。原实现把账本固定写进 apply-log.json
+ *   且只记世界标题（标题可重复、可改名），于是：A 世界恢复 → B 世界恢复
+ *   （账本被覆盖）→ 回 A 点「回档」，写进 A 的是 B 的旧值。实测复现：服务器
+ *   上账本归属「银爪月影」而主快照归属「初始世界（数据）」，账本里含 5.6KB 的
+ *   core.moduleConfiguration（模块启用列表），一旦跨世界回档就会把别的世界的
+ *   模块开关照搬过来，刷新页面后一堆模块开开关关对不上。
+ *   对策：① 账本按世界分区 {schema:2, worlds:{"<worldId>":{...}}}，worldId 取
+ *   game.world.id（官方同源用法：client/documents/abstract/client-document.mjs:943
+ *   worldId: game.world.id），不受世界改名影响；
+ *   ② 回档只读本世界那一格，读不到就拒绝（不写任何东西）；
+ *   ③ 旧版单条格式账本一律不认领（宁可不回档，也不乱写）；
+ *   ④ 回档确认弹窗显示「记录归属：<世界名> · 写入时间」。
  * v1.0.8：修复导出文件名丢失（下载成 blob UUID、无扩展名）。根因=FVTT
  *   全局 click 监听（client/game.mjs:2018 → :2049 _onClickHyperlink）对
  *   任何 a[href] 执行 preventDefault + window.open，把 <a download> 干掉。
@@ -50,7 +62,7 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.0.8";
+const MODULE_VERSION = "1.0.9";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
@@ -58,6 +70,15 @@ window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_
 const STORAGE_DIR = "modules/lh-world-sync/storage";
 const MASTER_FILE = "world-snapshot-master.json";
 const APPLOG_FILE = "apply-log.json";
+// 回档账本 schema 2（v1.0.9）：账本按世界分区，A/B 世界不再互相覆盖
+const APPLOG_SCHEMA = 2;
+// 当前世界的稳定标识：world.id 不随世界改名而变
+// （官方同源用法：client/documents/abstract/client-document.mjs:943
+//   worldId: game.world.id —— 官方导出文档时就是用 world.id 标世界归属）
+function currentWorldId() {
+  const id = game.world?.id;
+  return id ? String(id) : String(game.world?.title ?? "unknown");
+}
 // 默认排除键（导出+导入双端防御；导入侧无视一切强制跳过）。
 // foundry-mcp-bridge.lastActivity 是心跳时间戳：每次刷新页面都会变，
 // 同步它没有意义，还会让「恢复主世界」每次都提示一条假差异——默认忽略。
@@ -274,20 +295,47 @@ function describeChange(from, to) {
   if (!falsy(from) && falsy(to)) return "→关闭";
   return "→修改";
 }
-// applyLog: { ts, sourceWorld, appVersion, prev: { key: { present, value } } }
+// 回档账本（v1.0.9 起按世界分区）：
+// { schema: 2, worlds: { "<worldId>": { ts, worldId, worldTitle, appVersion, prev } } }
+// prev = { key: { present, value } }；present:false 表示该键在恢复前并不存在。
+function emptyApplyLogStore() { return { schema: APPLOG_SCHEMA, worlds: {} }; }
+// 读整个账本容器。旧版单条格式（无 schema/worlds）一律不认领：
+// 宁可不回档，也不能把来源不明的旧值写进当前世界。
+async function readApplyLogStore() {
+  const text = await storageRead(APPLOG_FILE);
+  if (!text) return emptyApplyLogStore();
+  try {
+    const raw = JSON.parse(text);
+    if (raw && raw.schema === APPLOG_SCHEMA && raw.worlds && typeof raw.worlds === "object") return raw;
+    console.warn("[lh-world-sync] 检测到旧格式账本（无世界分区），已忽略，不再作为回档依据");
+    return emptyApplyLogStore();
+  } catch (e) { return emptyApplyLogStore(); }
+}
+// 写入时只覆盖「本世界」那一格，其他世界的记录原样保留
 async function writeApplyLog(prevMap) {
-  const log = {
+  const store = await readApplyLogStore();
+  const wid = currentWorldId();
+  store.worlds[wid] = {
     ts: new Date().toISOString(),
-    sourceWorld: game.world?.title ?? "",
+    worldId: wid,
+    worldTitle: game.world?.title ?? "",
     appVersion: MODULE_VERSION,
     prev: Object.fromEntries([...prevMap.entries()].map(([k, v]) => [k, { present: v.present, value: v.value }]))
   };
-  await storageWrite(APPLOG_FILE, JSON.stringify(log, null, 2));
+  await storageWrite(APPLOG_FILE, JSON.stringify(store, null, 2));
 }
+// 只返回「当前世界」的账本条目；读不到 = 本世界没有可回档记录
 async function readApplyLog() {
-  const text = await storageRead(APPLOG_FILE);
-  if (!text) return null;
-  try { return JSON.parse(text); } catch (e) { return null; }
+  const store = await readApplyLogStore();
+  const entry = store.worlds?.[currentWorldId()];
+  return (entry && entry.prev) ? entry : null;
+}
+// 展示用时间：ISO → 本地 2026-09-10 01:03（ISO 串人读不了）
+function formatTs(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso ?? "");
+  const p = (x) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 async function applySnapshot(snap, selection) {
   const diff = diffSnapshot(snap, selection);
@@ -337,6 +385,12 @@ async function applySnapshot(snap, selection) {
 async function rollbackApplyLog() {
   const log = await readApplyLog();
   if (!log?.prev) return null;
+  // 纵深防御：账本必须属于当前世界（readApplyLog 已按 worldId 只取本世界的格子，
+  // 这里再核一次 worldId，防止将来改动绕过这道门）
+  if (log.worldId && String(log.worldId) !== currentWorldId()) {
+    console.warn("[lh-world-sync] 回档被拒：账本属于其他世界", log.worldId);
+    return null;
+  }
   const SettingDoc = settingDocumentClass();
   const restored = [];
   for (const [key, p] of Object.entries(log.prev)) {
@@ -504,7 +558,7 @@ function openRollbackDialog() {
     if (!log) {
       new Dialog({
         title: "回档",
-        content: `<div class="wsync-body"><div class="wsync-diff-summary">暂无可回档记录。仅在执行过「恢复主世界」之后才会生成回档记录。</div></div>`,
+        content: `<div class="wsync-body"><div class="wsync-diff-summary">本世界（${escapeHtml(game.world?.title ?? "")}）暂无可回档记录。回档记录按世界分开保存，且仅在执行过「恢复主世界」之后才会生成。</div></div>`,
         buttons: { close: { icon: "<i class=\"fa-solid fa-xmark\"></i>", label: "关闭", callback: () => {} } },
         render: ($h) => styleWindow($h)
       }, { classes: ["dialog", "wsync-app"], width: 520 }).render(true);
@@ -518,7 +572,7 @@ function openRollbackDialog() {
     const trimmed = entries.length > 120 ? `<div class="wsync-diff-more">…还有 ${entries.length - 120} 项</div>` : "";
     const dlg = new Dialog({
       title: "回档 · 恢复到上次恢复前",
-      content: `<div class="wsync-body"><div class="wsync-diff-summary">上次恢复：${escapeHtml(log.sourceWorld)} · ${escapeHtml(log.ts)} · 共 ${entries.length} 项。回档仅还原这些设置，此后手动修改的其他设置不受影响。</div>${lines}${trimmed}</div>`,
+      content: `<div class="wsync-body"><div class="wsync-diff-summary"><b>记录归属：${escapeHtml(log.worldTitle || currentWorldId())}</b> · 写入时间 ${escapeHtml(formatTs(log.ts))} · 共 ${entries.length} 项。<br>回档仅还原这些设置，此后手动修改的其他设置不受影响。</div>${lines}${trimmed}</div>`,
       buttons: {
         do: { icon: "<i class=\"fa-solid fa-rotate-left\"></i>", label: "执行回档", callback: async () => { dlg.close(); await doRollback(); } },
         cancel: { icon: "<i class=\"fa-solid fa-xmark\"></i>", label: "取消", callback: () => dlg.close() }
