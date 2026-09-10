@@ -1,0 +1,14 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# logs / temp
+*.log
+*.tmp
+
+# node
+node_modules/
+
+# 打包产物（zip 走 GitHub Release，不进 git）
+*.zip

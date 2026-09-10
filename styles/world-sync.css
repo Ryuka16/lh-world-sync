@@ -1,0 +1,343 @@
+/* ============================================================================
+ * 世界同步装置 (lh-world-sync) v1.0.0 — 样式
+ * 铁律参照：课程 CSS面板配置篇 / 教学视频库优化篇
+ *   - 变量挂 .wsync-app[data-theme] 与 .wsync-themed（双保险）
+ *   - .dialog-buttons 必须一并覆盖（窗口整体染色时底部标准按钮黑字黑底坑）
+ *   - .wsync-btn 必须 width:auto !important（全局 body.game .app button{width:100%}）
+ * ==========================================================================*/
+
+/* ---------- 五套主题变量 ---------- */
+.wsync-app[data-theme="deep"],
+.wsync-themed[data-theme="deep"] {
+  --wsync-bg: #0a0a0c; --wsync-bg2: #111318; --wsync-surface: #181c24;
+  --wsync-surface2: #232a36; --wsync-border: #2e3947; --wsync-text: #e2e8f0;
+  --wsync-muted: #8a95a5; --wsync-accent: #00d2ff; --wsync-accent2: #ffd700;
+  --wsync-glow: rgba(0, 212, 255, 0.35); --wsync-ok: #67b98e; --wsync-bad: #ff6b6b;
+}
+.wsync-app[data-theme="bluewhite"],
+.wsync-themed[data-theme="bluewhite"] {
+  --wsync-bg: #eef5fb; --wsync-bg2: #ffffff; --wsync-surface: #f7fbff;
+  --wsync-surface2: #dfeaf5; --wsync-border: #b8cfe2; --wsync-text: #1d2f45;
+  --wsync-muted: #6b85a0; --wsync-accent: #1e88e5; --wsync-accent2: #f5a623;
+  --wsync-glow: rgba(30, 136, 229, 0.25); --wsync-ok: #2e8b57; --wsync-bad: #c0392b;
+}
+.wsync-app[data-theme="purgreen"],
+.wsync-themed[data-theme="purgreen"] {
+  --wsync-bg: #0e1512; --wsync-bg2: #131c17; --wsync-surface: #18251e;
+  --wsync-surface2: #22332a; --wsync-border: #2f4a3a; --wsync-text: #dff3e6;
+  --wsync-muted: #86a894; --wsync-accent: #4cd964; --wsync-accent2: #ffd166;
+  --wsync-glow: rgba(76, 217, 100, 0.3); --wsync-ok: #67c98e; --wsync-bad: #ff6b6b;
+}
+.wsync-app[data-theme="gold"],
+.wsync-themed[data-theme="gold"] {
+  --wsync-bg: #14100a; --wsync-bg2: #1c160d; --wsync-surface: #241d12;
+  --wsync-surface2: #2f2615; --wsync-border: #4a3d22; --wsync-text: #f2e7c9;
+  --wsync-muted: #b39b6b; --wsync-accent: #f0c060; --wsync-accent2: #ff8c42;
+  --wsync-glow: rgba(240, 192, 96, 0.3); --wsync-ok: #9ccc65; --wsync-bad: #ef5350;
+}
+.wsync-app[data-theme="mint"],
+.wsync-themed[data-theme="mint"] {
+  --wsync-bg: #0d1614; --wsync-bg2: #121f1c; --wsync-surface: #172a25;
+  --wsync-surface2: #21382f; --wsync-border: #2e5146; --wsync-text: #d9f2ec;
+  --wsync-muted: #7fa398; --wsync-accent: #5eead4; --wsync-accent2: #f0abfc;
+  --wsync-glow: rgba(94, 234, 212, 0.3); --wsync-ok: #6ee7b7; --wsync-bad: #fb7185;
+}
+.wsync-app:not([data-theme]),
+.wsync-themed:not([data-theme]) {
+  --wsync-bg: #0a0a0c; --wsync-bg2: #111318; --wsync-surface: #181c24;
+  --wsync-surface2: #232a36; --wsync-border: #2e3947; --wsync-text: #e2e8f0;
+  --wsync-muted: #8a95a5; --wsync-accent: #00d2ff; --wsync-accent2: #ffd700;
+  --wsync-glow: rgba(0, 212, 255, 0.35); --wsync-ok: #67b98e; --wsync-bad: #ff6b6b;
+}
+
+/* ---------- 窗口整体染色（含底部按钮区） ---------- */
+.wsync-themed.window-app {
+  background: var(--wsync-bg) !important;
+  border: 1px solid var(--wsync-border) !important;
+  color: var(--wsync-text) !important;
+}
+.wsync-themed.window-app .window-title,
+.wsync-themed.window-app .window-content {
+  color: var(--wsync-text) !important;
+}
+.wsync-themed.window-app .window-content {
+  background: transparent !important;
+}
+.wsync-themed.window-app .window-header {
+  background: var(--wsync-bg2) !important;
+  border-bottom: 1px solid var(--wsync-border) !important;
+}
+
+/* ---------- Dialog 底部标准按钮覆盖（铁律：整体染色必配） ---------- */
+.wsync-app .dialog-buttons {
+  background: var(--wsync-bg2) !important;
+  border-top: 1px solid var(--wsync-border) !important;
+}
+.wsync-app .dialog-buttons .dialog-button {
+  background: var(--wsync-surface2) !important;
+  border: 1px solid var(--wsync-border) !important;
+  color: var(--wsync-text) !important;
+  width: auto !important;
+  min-width: 96px;
+  margin: 4px 2px !important;
+  padding: 5px 12px !important;
+}
+.wsync-app .dialog-buttons .dialog-button:hover {
+  border-color: var(--wsync-accent) !important;
+  color: var(--wsync-accent) !important;
+  box-shadow: 0 0 12px var(--wsync-glow) !important;
+}
+
+/* ---------- 面板主体 ---------- */
+.wsync-body {
+  box-sizing: border-box;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--wsync-text);
+  padding: 4px 6px 6px;
+}
+
+/* ---------- 主题行 ---------- */
+.wsync-theme-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  background: var(--wsync-surface);
+  border: 1px solid var(--wsync-border);
+  border-radius: 6px;
+}
+.wsync-theme-label { color: var(--wsync-muted); font-size: 12px; }
+.wsync-theme-dot {
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--wsync-border);
+  background: var(--wsync-accent);
+  cursor: pointer;
+  display: inline-block;
+}
+.wsync-theme-dot:nth-of-type(3) { background: #eef5fb; }
+.wsync-theme-dot:nth-of-type(4) { background: #4cd964; }
+.wsync-theme-dot:nth-of-type(5) { background: #f0c060; }
+.wsync-theme-dot:nth-of-type(6) { background: #5eead4; }
+.wsync-theme-dot:hover { box-shadow: 0 0 8px var(--wsync-glow); }
+.wsync-theme-dot.wsync-theme-active {
+  border-color: var(--wsync-accent2);
+  box-shadow: 0 0 10px var(--wsync-glow);
+}
+.wsync-theme-current { margin-left: auto; color: var(--wsync-muted); font-size: 12px; }
+
+/* ---------- 状态行 ---------- */
+.wsync-status {
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  background: var(--wsync-surface);
+  border: 1px solid var(--wsync-border);
+  border-radius: 6px;
+  color: var(--wsync-text);
+  font-size: 12px;
+}
+.wsync-status b { color: var(--wsync-accent); }
+.wsync-status-none { color: var(--wsync-muted); }
+.wsync-diff-has { color: var(--wsync-accent2); }
+
+/* ---------- 勾选区 ---------- */
+.wsync-sec-title {
+  font-size: 12px;
+  color: var(--wsync-muted);
+  margin: 8px 2px 4px;
+  letter-spacing: 1px;
+}
+.wsync-ns-list {
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--wsync-border);
+  border-radius: 6px;
+  background: var(--wsync-surface);
+  padding: 4px;
+}
+.wsync-ns-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.wsync-ns-row:hover { background: var(--wsync-surface2); }
+.wsync-ns-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wsync-ns-name b { color: var(--wsync-accent); }
+.wsync-ns-count { color: var(--wsync-muted); font-size: 11px; }
+.wsync-ns-modcfg .wsync-ns-name { color: var(--wsync-accent2); }
+
+/* ---------- 高级区 ---------- */
+.wsync-adv { margin: 8px 0 2px; }
+.wsync-adv summary {
+  cursor: pointer;
+  color: var(--wsync-muted);
+  font-size: 12px;
+}
+.wsync-adv-edit {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.wsync-adv-edit input {
+  flex: 1;
+  background: var(--wsync-surface);
+  border: 1px solid var(--wsync-border);
+  color: var(--wsync-text);
+  border-radius: 4px;
+  padding: 4px 8px;
+}
+
+/* ---------- 通用按钮 ---------- */
+.wsync-btn {
+  background: var(--wsync-surface2) !important;
+  border: 1px solid var(--wsync-border) !important;
+  color: var(--wsync-text) !important;
+  border-radius: 5px;
+  padding: 5px 12px;
+  cursor: pointer;
+  width: auto !important;
+  font-size: 12px;
+}
+.wsync-btn:hover {
+  border-color: var(--wsync-accent) !important;
+  color: var(--wsync-accent) !important;
+  box-shadow: 0 0 10px var(--wsync-glow) !important;
+}
+
+/* ---------- 差异列表 ---------- */
+.wsync-diff-summary {
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  background: var(--wsync-surface);
+  border: 1px solid var(--wsync-border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.wsync-diff-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--wsync-border);
+  font-size: 12px;
+}
+.wsync-diff-row:last-child { border-bottom: none; }
+.wsync-diff-row code {
+  flex: 0 0 46%;
+  color: var(--wsync-text);
+  overflow-wrap: anywhere;
+  font-family: Consolas, monospace;
+}
+.wsync-diff-tag {
+  flex: 0 0 auto;
+  color: var(--wsync-accent2);
+  font-size: 11px;
+  padding: 1px 6px;
+  border: 1px solid var(--wsync-border);
+  border-radius: 4px;
+}
+.wsync-diff-vals {
+  flex: 1;
+  color: var(--wsync-muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.wsync-v-now { color: var(--wsync-muted); }
+.wsync-v-master { color: var(--wsync-accent); }
+.wsync-diff-more { padding: 6px; color: var(--wsync-muted); font-size: 12px; }
+
+/* ---------- 文件区 ---------- */
+.wsync-file-note {
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  background: var(--wsync-surface);
+  border: 1px solid var(--wsync-border);
+  border-radius: 6px;
+  color: var(--wsync-muted);
+  font-size: 12px;
+}
+.wsync-file-btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.wsync-file-msg { font-size: 12px; min-height: 18px; }
+.wsync-file-ok { color: var(--wsync-ok); }
+.wsync-file-err { color: var(--wsync-bad); }
+.wsync-paste {
+  width: 100%;
+  min-height: 140px;
+  background: var(--wsync-surface);
+  border: 1px solid var(--wsync-border);
+  color: var(--wsync-text);
+  border-radius: 6px;
+  padding: 8px;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+
+/* ---------- 自动提醒弹窗 ---------- */
+.wsync-prompt-banner {
+  padding: 8px 10px;
+  background: var(--wsync-surface);
+  border: 1px solid var(--wsync-accent);
+  border-radius: 6px;
+  margin-bottom: 8px;
+  color: var(--wsync-text);
+}
+.wsync-prompt-banner b { color: var(--wsync-accent); }
+.wsync-prompt-hint { color: var(--wsync-muted); font-size: 12px; }
+
+/* ---------- 侧边栏按钮（沿用官方 ui-control plain icon 样式，无需自定义） ---------- */
+
+/* ---------- v1.0.5 简化面板：主提示 / 模块中文名 / 高级区内部 ---------- */
+.wsync-main-hint {
+  color: var(--wsync-muted);
+  font-size: 12px;
+  line-height: 1.7;
+  margin: 8px 2px 2px;
+  padding: 8px 10px;
+  background: var(--wsync-surface);
+  border-left: 3px solid var(--wsync-accent);
+  border-radius: 4px;
+}
+.wsync-main-hint b { color: var(--wsync-accent); }
+.wsync-ns-title {
+  font-style: normal;
+  color: var(--wsync-muted);
+  font-size: 11px;
+  margin-left: 6px;
+}
+.wsync-adv-body {
+  margin-top: 6px;
+  padding: 8px 2px 2px;
+  border-top: 1px solid var(--wsync-border);
+}
+.wsync-adv-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.wsync-ns-autoprompt { margin-top: 4px; }
+
+/* ---------- 快照导出：手动下载链接（兜底） ---------- */
+.wsync-file-link { margin-top: 8px; }
+.wsync-dl {
+  display: inline-block;
+  padding: 5px 10px;
+  border-radius: 5px;
+  background: var(--wsync-surface2);
+  border: 1px solid var(--wsync-accent);
+  color: var(--wsync-accent) !important;
+  font-size: 12px;
+  text-decoration: none;
+}
+.wsync-dl:hover { background: var(--wsync-surface); }
+.wsync-dl-tip { color: var(--wsync-muted); font-size: 11px; margin-left: 4px; }
