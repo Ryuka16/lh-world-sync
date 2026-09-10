@@ -1,5 +1,5 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.2.0 — 样式
+ * 世界同步装置 (lh-world-sync) v1.2.5 — 样式
  * 铁律参照：课程 CSS面板配置篇 / 教学视频库优化篇
  *   - 变量挂 .wsync-app[data-theme] 与 .wsync-themed（双保险）
  *   - .dialog-buttons 必须一并覆盖（窗口整体染色时底部标准按钮黑字黑底坑）
@@ -117,10 +117,13 @@
   cursor: pointer;
   display: inline-block;
 }
-.wsync-theme-dot:nth-of-type(3) { background: #eef5fb; }
-.wsync-theme-dot:nth-of-type(4) { background: #4cd964; }
-.wsync-theme-dot:nth-of-type(5) { background: #f0c060; }
-.wsync-theme-dot:nth-of-type(6) { background: #5eead4; }
+/* v1.2.2：改用属性选择器定位，不再依赖 nth-of-type 与 DOM 顺序 ——
+   原来只要在圆点前面多插一个 span，5 套配色就整体错位一格，而且不会报错。
+   deep 沿用上面那条规则的 var(--wsync-accent)，这里只覆盖另外四套。 */
+.wsync-theme-dot[data-theme-dot="bluewhite"] { background: #eef5fb; }
+.wsync-theme-dot[data-theme-dot="purgreen"] { background: #4cd964; }
+.wsync-theme-dot[data-theme-dot="gold"] { background: #f0c060; }
+.wsync-theme-dot[data-theme-dot="mint"] { background: #5eead4; }
 .wsync-theme-dot:hover { box-shadow: 0 0 8px var(--wsync-glow); }
 .wsync-theme-dot.wsync-theme-active {
   border-color: var(--wsync-accent2);
@@ -375,3 +378,28 @@
   line-height: 1.7;
 }
 .wsync-compat b { color: var(--wsync-accent2); }
+
+/* ---------- v1.2.1 新增：状态栏里的「上一次恢复改动了什么」入口 ---------- */
+.wsync-last-report {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--wsync-border);
+  font-size: 11.5px;
+  color: var(--wsync-muted);
+}
+.wsync-last-report b { color: var(--wsync-accent); }
+.wsync-link {
+  color: var(--wsync-accent2) !important;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.wsync-link:hover { color: var(--wsync-accent) !important; }
+
+/* v1.2.4：差异行里的箭头。JS 从 v1.0.x 起就在用 .wsync-v-arrow，
+   但本文件从未定义过它（一直靠继承），补上定义。 */
+.wsync-v-arrow {
+  opacity: 0.55;
+  margin: 0 0.35em;
+  font-family: var(--wsync-mono, ui-monospace, monospace);
+}
