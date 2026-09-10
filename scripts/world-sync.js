@@ -1,5 +1,23 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.3.2
+ * 世界同步装置 (lh-world-sync) v1.3.3
+ * ----------------------------------------------------------------------------
+ * v1.3.3：外部审阅（对 v1.3.1 的复审）报出 4 条，逐条到代码里核实后**全部属实**，
+ *   一次修完。四条的共同病根是同一句话：**同一件事存在多套语义**。
+ *   ① 【恢复范围被放大】buildSelection() 里「空 custom 视为全部」的兜底，在
+ *      「取消全部模块 + 只留模组启用状态」这个**合法**组合下也会命中（picked 同为 0），
+ *      于是用户明确不想同步的模块设置被整份覆盖。删掉兜底：范围只由 mode 决定，
+ *      「允不允许空」只由 saveScopePref 决定。
+ *   ② 【永久假差异】差异检测给目标值算的是「快照原值」，实际写入算的却是
+ *      「当前值打底 + 快照覆盖」。只要当前世界有快照里没有的模组，core.moduleConfiguration
+ *      就永远判定为差异：恢复 → 刷新 → 报同样的差异 → 再恢复，永不收敛。
+ *      现在差异 / 写入 / 账本 after 三处共用同一条规则（当前值是事实、不加工；
+ *      目标值一律走 keepSelfEnabled(key, 快照值, 当前值)）。
+ *   ③ 【多世界锁是假互斥】锁文件只有一份，却想同时表达「全局锁 + 多个世界锁」——
+ *      B 世界开始恢复会覆盖 A 的锁记录，B 先释放后，A 世界的第二位 GM 读到「没有人在操作」，
+ *      于是 A1 与 A2 同时写同一个世界。已改为**所有同步写操作全局串行**（用户拍板选此方案）。
+ *   ④ 【撤销点被静默覆盖】上一份账本另存 .prev 失败时只 warn 一句就继续写新账本，
+ *      唯一那份撤销点被永久覆盖，而界面上看不出异常。改为 fail closed：备份失败即抛错中止，
+ *      世界一个设置都不改，用户修好磁盘/权限后重试即可。
  * ----------------------------------------------------------------------------
  * v1.3.2：把「本机没装这个模组」这句话说准，并把 world 从误判里摘出来。
  *   起因：用户在面板上看到 ActiveAuras / aeris-tokens / bg3-inspired-hotbar 这些
@@ -383,7 +401,7 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.3.2";
+const MODULE_VERSION = "1.3.3";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
@@ -776,9 +794,14 @@ async function acquireLock(opName) {
       const effExpires = hardCap
         ? Math.min(Number(l?.expiresAt) || 0, hardCap)
         : (Number(l?.expiresAt) || 0);
-      const lockScope = l?.scope || "world";       // 旧锁没有 scope 字段 → 按世界级处理
-      const crossWorldConflict = isGlobalOp || lockScope === "global";
-      if (effExpires > now && (crossWorldConflict || l.worldId === currentWorldId()) && !(sameOwner && samePage)) {
+      // v1.3.3（外部审阅第 3 条）：改为**所有同步写操作全局串行**。
+      // 原设计按 scope 区分「全局资源（主快照）/ 世界资源（本世界设置）」，但两者共用
+      // 同一个 operation-lock.json —— 单份锁表达不了「A 世界与 B 世界各持一把锁」：
+      // B 世界开始恢复会**覆盖** A 的锁记录，B 先结束并释放后，A 世界的第二位 GM 读到的
+      // 是「没有人在操作」→ A1 与 A2 同时写同一个世界，正是这把锁要防的事。
+      // 同步操作都是低频管理动作，没有并发的必要：全局互斥换来「行为可推理」。
+      // （锁对象仍写 scope 字段便于日志辨认，但不再参与判定；旧锁没该字段也不影响。）
+      if (effExpires > now && !(sameOwner && samePage)) {
         // staleSelf：这把锁是自己这个会话、但上一个页面留下的 —— 上层据此给出
         // 「你刚刷新过，上一次操作可能还没结束」这种能解释清楚的提示，
         // 而不是含混地说「另一位 GM」。
@@ -795,7 +818,7 @@ async function acquireLock(opName) {
   const lock = {
     operationId: foundry.utils.randomID(),
     op: opName,
-    scope: isGlobalOp ? "global" : "world",   // v1.3.1：全局资源（主快照）与世界资源（本世界设置）分开
+    scope: isGlobalOp ? "global" : "world",   // v1.3.3：仅用于日志辨认操作类型，不再参与互斥判定（已改全局串行）
     worldId: currentWorldId(),
     worldTitle: game.world?.title ?? "",
     userId: game.user.id,
@@ -863,7 +886,9 @@ async function withOpLock(opName, fn, label) {
           + "请先等它跑完（最长约 2 分钟），再操作。现在重复操作会让两次写入互相覆盖，撤销点会丢失。");
         return { locked: true, staleSelf: true };
       }
-      notify.warn(`已有进行中的「${escapeHtml(zh)}」操作（${escapeHtml(who)}${when ? " 于 " + when + " 开始" : ""}），请稍后再试。若对方已中断，约 2 分钟后会自动解锁。`);
+      // v1.3.3：锁已改为全局串行 —— 挡住你的操作可能来自**另一个世界**的另一位 GM，
+      // 所以文案不再暗示「只可能是本世界的另一个人」，并把对方所在世界一并说出来。
+      notify.warn(`已有进行中的「${escapeHtml(zh)}」操作（${escapeHtml(who)}${h.worldTitle ? " · " + escapeHtml(h.worldTitle) : ""}${when ? " 于 " + when + " 开始" : ""}），请稍后再试。若对方已中断，约 2 分钟后会自动解锁。`);
       return { locked: true };
     }
     try { return await fn(); } finally { await releaseLock(got.lock); }
@@ -1098,10 +1123,15 @@ function diffSnapshot(snap, selection, currentOverride) {
     // 否则「快照里本模块是关的 → 恢复时被强制保留为启用 → 当前值比快照多一项」
     // 会让 core.moduleConfiguration 永远判定为差异，每次进世界都弹一次假提醒
     // （和当年 foundry-mcp-bridge.lastActivity 那次心跳假差异同一个病）。
-    const cur = keepSelfEnabled(key, current.has(key) ? current.get(key) : undefined);
-    const to = keepSelfEnabled(key, item.value);
-    if (!isJSONEqual(cur, to)) {
-      changed.push({ key, from: cur, to });
+    // v1.3.3（外部审阅第 2 条）：上面的做法只解决了一半 —— 目标值走的仍是「快照原值」，
+    // 而实际写入走的是「当前值打底 + 快照覆盖」的合并规则。只要当前世界有快照里没有的
+    // 模组，这条键就永远判定为差异（恢复 → 刷新 → 报同样的差异 → 再恢复，永不收敛）。
+    // 现在三处（差异 / 写入 / 账本 after）共用同一条规则：当前值是事实、不加工；
+    // 目标值一律套用 keepSelfEnabled(key, 快照值, 当前值)。
+    const curVal = current.has(key) ? current.get(key) : undefined;
+    const to = keepSelfEnabled(key, item.value, curVal);
+    if (!isJSONEqual(curVal, to)) {
+      changed.push({ key, from: curVal, to });
       nsCount[ns] = (nsCount[ns] || 0) + 1;
     }
   }
@@ -1290,8 +1320,17 @@ async function writeApplyLog(prevMap, afterMap) {
     try {
       await storageWrite(applyLogPrevFile(), JSON.stringify(existing, null, 2));
     } catch (e) {
-      console.warn("[lh-world-sync] 上一份回档记录未能另存备份：" + (e?.message || e));
-      try { notify.warn("注意：上一份回档记录未能备份（" + escapeHtml(e?.message || String(e)) + "），本次恢复会把它覆盖掉。"); } catch (e2) { /* 忽略 */ }
+      // v1.3.3（外部审阅第 4 条）：备份失败必须 fail closed，不能只警告一句。
+      // 账本是**唯一**的撤销点，覆盖即永失 —— 服务器上没有它的备份，Foundry 也没有
+      // 删除/恢复文件的 API。原实现 warn 完照样覆盖：用户此后无路可退，界面上却看不出
+      // 任何异常（只有一句一闪而过的通知）。改成抛错 → 走 __notStarted 路径 →
+      // 世界一个设置都不会被改，用户修好磁盘/权限后重试即可。
+      const msg = e?.message || String(e);
+      console.error("[lh-world-sync] 上一份回档记录未能另存备份：" + msg);
+      const err = new Error("上一份回档记录无法备份（" + msg
+        + "）——为避免永久失去「回档」撤销点，本次恢复已取消，世界一个设置都没有改动。");
+      err.__backupFailed = true;
+      throw err;
     }
   }
   const opId = myPageToken() + ":" + Date.now();   // 本次恢复的标识，供写完设置后回写完成标记
@@ -1905,10 +1944,12 @@ function buildSelection(snap, pref = readScopePref()) {
     if (item.key === "core.moduleConfiguration") hasModCfg = true;
   }
   const picked = Object.keys(pref.ns).filter(k => pref.ns[k]);
-  // custom 模式下一个模块都没勾 → 视为全部（不出现「恢复什么都没做」的死状态）。
-  // v1.2.2 备注：这条兜底现在只在「偏好被手工改成空 custom」时才可能命中 ——
-  // saveScopePref 已经拒绝保存 0 勾选的范围，正常操作不会再生成这种偏好。
-  if (pref.mode === "all" || !picked.length) {
+  // v1.3.3（外部审阅第 1 条）：**删掉「空 custom 视为全部」这条兜底**。
+  // 它原意是防「恢复什么都没做」的死状态，但 saveScopePref 只拒绝「0 勾选**且**没勾
+  // 模组开关」，而「取消全部模块 + 只留模组启用状态」是完全合法的组合（picked 也是 0）——
+  // 于是那份偏好被这里当成 all，用户明确不想同步的模块设置会被整份覆盖。
+  // 语义只允许一处说了算：mode 决定范围，saveScopePref 决定「允不允许空」。
+  if (pref.mode === "all") {
     for (const ns of snapNs) sel.ns[ns] = true;
   } else {
     for (const ns of picked) sel.ns[ns] = true;
@@ -2007,11 +2048,15 @@ async function proceedApplySnap(changed) {
     // 并明确让用户先别刷新（刷新会丢掉现场）。
     // v1.2.3：三种失败要分三句话说 —— 「一个字都没改」「改了又回滚成功」「改了且回滚也失败」。
     // 原来只有后两种情况，账本写不进去时会被说成「已自动回滚到恢复前的状态」（假话）。
-    notify.err(e?.__notStarted
-      ? "恢复没有开始：回档账本写不进服务器（磁盘满或目录权限问题），世界的设置一个字都没动。错误：" + (e?.message || e)
-      : e?.__rollbackFailed
-        ? "恢复失败，且自动回滚没能完成（世界可能停在中间状态）。请不要刷新页面，先看控制台错误，必要时用「回档」重试。错误：" + (e?.message || e)
-        : "恢复失败，已自动回滚到恢复前的状态：" + (e?.message || e));
+    // v1.3.3（外部审阅第 4 条）：备份撤销点失败也归到「没有开始」这一档，
+    // 但用错误自带的说明（它已讲清是「上一份回档记录无法备份」），不要套用账本那条。
+    notify.err(e?.__backupFailed
+      ? (e?.message || String(e))
+      : e?.__notStarted
+        ? "恢复没有开始：回档账本写不进服务器（磁盘满或目录权限问题），世界的设置一个字都没动。错误：" + (e?.message || e)
+        : e?.__rollbackFailed
+          ? "恢复失败，且自动回滚没能完成（世界可能停在中间状态）。请不要刷新页面，先看控制台错误，必要时用「回档」重试。错误：" + (e?.message || e)
+          : "恢复失败，已自动回滚到恢复前的状态：" + (e?.message || e));
   }
 }
 function openApplyReportDialog(applied, skipped) {
