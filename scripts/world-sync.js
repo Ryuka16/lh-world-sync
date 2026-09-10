@@ -1,7 +1,27 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.2.6
+ * 世界同步装置 (lh-world-sync) v1.2.7
  * ----------------------------------------------------------------------------
  * 功能：把一个世界当作「主世界」保存配置快照；新世界一键读回。
+ * v1.2.7：第六轮 —— 对 v1.2.6 那次修复本身做的独立盲审（1 条严重、6 条一般、10 条建议），
+ *   本轮改掉 7 处：
+ *   ① 【性能】存主世界后不再把刚上传的快照整份读回来（本机实测 8.8MB / 约 4 秒）——
+ *      原来写完文件紧接着调 refreshStatus(true)，只为刷新状态栏一行差异数就重新下载 + 解析
+ *      整份快照。现在把刚生成的快照直接交给它。世界越大、存档越慢，感知越明显。
+ *   ② 【S-1 严重】回档说明弹窗补认 legacyLogReadError：v1.2.6 给旧版合并账本的读失败
+ *      单独记了状态，但**只有 doRollback 读它**，弹窗没读 —— 主账本本来就不存在、旧账本
+ *      又读不到时，界面说「暂无可回档记录」，而撤销点很可能就在那份读不到的文件里。
+ *   ③ 【G-3】账本存在但内容不可用时，界面直说「坏在哪 + 原文件另存成了什么」，
+ *      不再只说「暂无可回档记录」；另存文件名由时间戳改为内容指纹，同一份坏账本
+ *      不再每打开一次面板就多出一个备份（与 README「不会累积文件」自相矛盾过）。
+ *   ④ 【G-6】账本补内容硬校验（validateApplyLogEntry）：键名必须含点、每条记录必须是
+ *      对象、present 必须是布尔、条目上限 20000。原来只校验 schema/worlds 两层结构，
+ *      内容不对时回档会照着账本里的键去删、去写**真实设置文档** —— 快照侧有十几条
+ *      硬校验，账本侧一条都没有。
+ *   ⑤ 【G-1】快照解析失败时清空 statusSnapCache：原来 parseSnapshot 抛错时赋值不执行，
+ *      上一次的旧快照留在缓存里，之后不带参数的刷新会拿旧基准算差异还显示得好好的。
+ *   ⑥ 【G-2】legacyLogReadError 每次读取先清零：原来主账本读到就直接 return，
+ *      旧值永远清不掉，会把一次正常读取讲成「读取失败」。
+ *   ⑦ 【G-4】保存「不参与恢复的设置」后刷新状态栏（排除表变了，差异数要重算）。
  * v1.2.6：第五轮 —— 对 v1.2.5 那次修复本身做的独立盲审（v1.2.5 的 6 组声明里
  *   3 组完全修好、2 组只落一半、1 组引入新问题；新增 2 条严重、5 条一般、6 条建议）。
  *   本轮的主线是「同一件事在不同路径上说法不一致」：
@@ -262,7 +282,7 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.2.6";
+const MODULE_VERSION = "1.2.7";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
@@ -489,6 +509,10 @@ let applyLogReadError = null;      // 主账本 apply-log-<worldId>.json 本次�
 // v1.2.5 把它记进 applyLogReadError，于是这份永远不写的文件一旦读不到，
 // 每一次恢复都会被中止，理由还是错的（「为避免覆盖本世界原有的回档记录」）。
 let legacyLogReadError = null;
+// v1.2.7（第六轮盲审 G-3）：主账本文件存在、但内容不可用时，记下「坏在哪」和
+// 「原样另存成了哪个文件」。原来这两件事只在控制台里，界面上只说「暂无可回档记录」，
+// 用户会以为压根没有记录 —— 而撤销点很可能就躺在那份读不懂的文件里。
+let applyLogCorrupt = null;          // { reason: string, backup: string|null } 或 null
 async function storageRead(name) {
   const url = foundry.utils.getRoute(norm(STORAGE_DIR) + "/" + name);
   let r;
@@ -842,6 +866,34 @@ function describeChange(from, to) {
 // { schema: 2, worlds: { "<worldId>": { ts, worldId, worldTitle, appVersion, prev } } }
 // prev = { key: { present, value } }；present:false 表示该键在恢复前并不存在。
 function emptyApplyLogStore() { return { schema: APPLOG_SCHEMA, worlds: {} }; }
+// v1.2.7（第六轮盲审 G-6）：账本内容的**结构硬校验**。
+// 原来只校验 { schema, worlds } 两层，内容不对时（例如 prev 里混进了非对象的值）
+// 回档会照着账本里的键去删、去写真实 Setting 文档 —— 快照侧有十几条硬校验，
+// 账本侧一条都没有。补齐：prev 是对象、每项是对象、present 必须是布尔、键名必须含点。
+// 返回 null = 通过；返回字符串 = 不合格的原因。
+function validateApplyLogEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return "记录不是对象";
+  const prev = entry.prev;
+  if (!prev || typeof prev !== "object" || Array.isArray(prev)) return "prev 不是对象";
+  const keys = Object.keys(prev);
+  if (keys.length === 0) return "prev 里一条记录都没有";
+  if (keys.length > 20000) return "条目过多（" + keys.length + " 项，上限 20000）";
+  for (const k of keys) {
+    if (typeof k !== "string" || !k.includes(".")) return "键名不合法：" + String(k);
+    const p = prev[k];
+    if (!p || typeof p !== "object" || Array.isArray(p)) return "「" + k + "」的记录不是对象";
+    if (typeof p.present !== "boolean") return "「" + k + "」的 present 不是布尔值";
+  }
+  return null;
+}
+// v1.2.7（第六轮盲审 G-3）：同一份坏账本不要每次读取都另存一份新备份。
+// 用内容指纹做文件名后缀 —— 内容没变就不重复备，内容变了才新增一个。
+function contentTag(text) {
+  const s = String(text ?? "");
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36).slice(0, 8);
+}
 // 读整个账本容器。文件 = apply-log-<worldId>.json（只可能含本世界一格）。
 // 兼容：新文件不存在时，从旧版合并账本 apply-log.json 里取本世界那一格
 // （只读不写；下次恢复会落到新文件，旧文件保持原样由用户自行删除）。
@@ -850,22 +902,43 @@ async function readApplyLogStore() {
   // v1.2.4：读完立刻捕获本次读取的结果 —— 下面读旧版账本还会调用 storageRead，
   // 而 storageLastError 是单变量、会被覆写，晚一步读就等于读错（拿到别人的结果）。
   applyLogReadError = text ? null : storageLastError;
+  // v1.2.7（第六轮盲审 G-2）：每次读取都先清掉上一次的旧值。
+  // 原来 legacyLogReadError 只在「主账本读不到」的分支里被重设，主账本一旦读到
+  // 就直接 return，于是上一轮遗留的旧错误一直留着，会把一次正常读取讲成「读取失败」。
+  legacyLogReadError = null;
   if (text) {
+    let corrupt = null;   // v1.2.7（G-3）：坏在哪，要能说给用户听，不能只丢进控制台
     try {
       const raw = JSON.parse(text);
-      if (raw && raw.schema === APPLOG_SCHEMA && raw.worlds && typeof raw.worlds === "object") return raw;
-      console.warn("[lh-world-sync] 本世界账本文件格式异常，已忽略（不作为回档依据）");
+      if (raw && raw.schema === APPLOG_SCHEMA && raw.worlds && typeof raw.worlds === "object") {
+        // v1.2.7（G-6）：结构过关不等于内容可靠 —— 本世界那一格还要过硬校验，
+        // 否则回档会照着账本里的键去删、去写真实设置。
+        const mine = raw.worlds[currentWorldId()];
+        const bad = mine ? validateApplyLogEntry(mine) : null;
+        if (!bad) return raw;
+        corrupt = "记录内容不合法（" + bad + "）";
+        console.warn("[lh-world-sync] 本世界账本记录内容不合法：" + bad + "，已忽略（不作为回档依据）");
+      } else {
+        corrupt = "文件结构不符（缺少 schema / worlds 字段）";
+        console.warn("[lh-world-sync] 本世界账本文件格式异常，已忽略（不作为回档依据）");
+      }
     } catch (e) {
+      corrupt = "文件解析失败（" + (e?.message || e) + "）";
       console.warn("[lh-world-sync] 本世界账本文件解析失败，已忽略（不作为回档依据）", e);
     }
     // v1.2.6（第四轮盲审 T3）：格式不符/解析失败时，下面写账本会把这份文件**整份覆盖**。
     // 将来若升 schema，旧记录就此静默消失（违反「旧数据只读不删」）。先原样另存一份再继续；
     // 另存失败只告警，不阻断 —— 不能因为备份不了就让用户什么也做不了。
     try {
-      const bak = applyLogFile().replace(/\.json$/i, "") + ".bak-" + Date.now() + ".json";
+      // v1.2.7（G-3）：文件名改用内容指纹，不用时间戳 —— 同一份坏账本被反复读取时
+      // 不会再每次都造一个新备份（原来每次进面板都会多一个 .bak-<时间戳>.json，
+      // 与 README「不会累积文件」的说法自相矛盾）；内容真变了才会新增一个。
+      const bak = applyLogFile().replace(/\.json$/i, "") + ".bak-" + contentTag(text) + ".json";
       await storageWrite(bak, text);
-      console.warn("[lh-world-sync] 原账本格式不符，已原样另存为 " + bak + "（新账本将重新开始记）");
+      applyLogCorrupt = { reason: corrupt, backup: bak };
+      console.warn("[lh-world-sync] 原账本不可用（" + corrupt + "），已原样另存为 " + bak + "（新账本将重新开始记）");
     } catch (e2) {
+      applyLogCorrupt = { reason: corrupt, backup: null };
       console.warn("[lh-world-sync] 原账本另存失败（不影响后续操作，但旧记录会被覆盖）：" + (e2?.message || e2));
     }
     return emptyApplyLogStore();
@@ -894,6 +967,12 @@ async function readApplyLogStore() {
       const raw = JSON.parse(legacy);
       const wid = currentWorldId();
       if (raw && raw.schema === APPLOG_SCHEMA && raw.worlds?.[wid]) {
+        // v1.2.7（G-6）：旧版合并账本里本世界那一格同样要过内容校验
+        const badLegacy = validateApplyLogEntry(raw.worlds[wid]);
+        if (badLegacy) {
+          console.warn("[lh-world-sync] 旧版合并账本里本世界的记录内容不合法（" + badLegacy + "），已忽略。");
+          return emptyApplyLogStore();
+        }
         console.log("[lh-world-sync] 已从旧版合并账本 " + APPLOG_FILE_LEGACY + " 读到本世界的回档记录；"
           + "下次恢复起写入 " + applyLogFile() + "，旧文件保留不动，确认无误后可手动删除。");
         return { schema: APPLOG_SCHEMA, worlds: { [wid]: raw.worlds[wid] } };
@@ -1604,9 +1683,20 @@ function openRollbackDialog() {
     if (!log) {
       // v1.2.4：读失败 ≠ 没有记录。账本是唯一的撤销凭证，说错因果会让用户
       // 以为撤销点没了，转头继续改设置 —— 那时撤销点就真的没了。
-      const body = applyLogReadError
-        ? `<b>回档记录读取失败：</b>${escapeHtml(applyLogReadError)}<br>这不是「没有记录」——账本文件可能还在服务器上，请检查服务器连接后重开本面板再试。`
-        : `本世界（${escapeHtml(game.world?.title ?? "")}）暂无可回档记录。回档记录按世界分开保存，且仅在执行过「恢复主世界」之后才会生成。`;
+      // v1.2.7（第六轮盲审 S-1 + G-3）：
+      // ① 旧版合并账本读失败也要算「读不到」—— 原来这里只判 applyLogReadError，
+      //    于是「主账本本来就不存在 + 旧账本读失败」会显示成「暂无可回档记录」，
+      //    而撤销点很可能就在那份读不到的文件里（doRollback 早已修对，这里漏了）。
+      // ② 账本存在但内容不可用时，这里原来也说「暂无可回档记录」，原因与备份文件名
+      //    只落在控制台 —— 现在把「坏在哪、另存成了什么」直接摆在界面上。
+      const readErr = applyLogReadError || legacyLogReadError;
+      const body = readErr
+        ? `<b>回档记录读取失败：</b>${escapeHtml(readErr)}<br>这不是「没有记录」——账本文件可能还在服务器上，请检查服务器连接后重开本面板再试。`
+        : applyLogCorrupt
+          ? `<b>账本文件存在，但内容不可用：</b>${escapeHtml(applyLogCorrupt.reason)}<br>${applyLogCorrupt.backup
+            ? `原文件已原样另存为 <code>${escapeHtml(applyLogCorrupt.backup)}</code>，可在服务器上查看它是否还留着你要的撤销点。`
+            : "（原样另存也没能成功，下次恢复会把这份文件整份覆盖。）"}<br>本世界暂时没有可用的回档记录。`
+          : `本世界（${escapeHtml(game.world?.title ?? "")}）暂无可回档记录。回档记录按世界分开保存，且仅在执行过「恢复主世界」之后才会生成。`;
       new Dialog({
         title: "回档",
         content: `<div class="wsync-body"><div class="wsync-diff-summary">${body}</div></div>`,
@@ -1974,7 +2064,9 @@ async function openSyncPanel() {
             if (!backed.ok) return { backupFailed: backed };   // v1.2.4：没备份成就不覆盖
             const snap = buildSnapshot();
             const path = await storageWrite(MASTER_FILE, JSON.stringify(snap, null, 2));
-            return { count: snap.settings.length, path, backed: backed.path };
+            // v1.2.7：把刚生成的快照一并交出去 —— 下面刷新状态栏直接用它，
+            // 不再把刚上传上去的这份文件整份下载回来（本机实测 8.8MB / 约 4 秒）。
+            return { count: snap.settings.length, path, backed: backed.path, snap };
           });
           if (r?.locked || r?.busy) return;
           if (r?.backupFailed) {
@@ -1986,7 +2078,7 @@ async function openSyncPanel() {
           }
           notify.ok(`已保存主世界快照：${r.count} 项设置（${r.path}）`
             + (r.backed ? `；上一份已备份为 ${r.backed}` : "；此前没有旧主快照，无需备份"));
-          refreshStatus(true);
+          refreshStatus(r.snap);
         } catch (e) { console.error(e); notify.err("保存失败:" + (e?.message || e)); }
       } },
       apply: { icon: "<i class=\"fa-solid fa-check\"></i>", label: "恢复主世界", callback: async (h, evt) => {
@@ -2066,6 +2158,7 @@ async function openSyncPanel() {
             + escapeHtml(EXCLUDE_DEFAULT.join("、"))
             + (keys.length ? "；另外排除：" + escapeHtml(keys.join("、")) : "；本次没有追加项。"));
         } catch (e) { notify.err("保存失败:" + (e?.message || e)); }
+        refreshStatus();   // v1.2.7（G-4）：排除表变了，状态栏那行差异数要跟着重算
       });
       // 自动提醒开关
       $h.find("#wsync-autoprompt").on("change", async (ev) => {
@@ -2080,7 +2173,7 @@ async function openSyncPanel() {
   dlg.render(true);
   openPanelDlg = dlg;                       // v1.2.2：登记单例
 
-  async function refreshStatus(forceSnap) {
+  async function refreshStatus(snapOverride) {
     // v1.2.2：只操作自己这个面板的元素。原来用全局选择器 $(".wsync-app.wsync-panel").first()，
     // 多面板时会写到别的窗口；而且对话框关闭后元素仍会在 DOM 里残留约 200ms（slideUp 动画），
     // first() 可能命中那个正在关闭的旧面板。dlg.element 是 jQuery 对象，用法与原来一致。
@@ -2093,8 +2186,15 @@ async function openSyncPanel() {
     const $apEarly = $h.find("#wsync-autoprompt");
     if ($apEarly.length) $apEarly.prop("checked", game.settings.get(MODULE_ID, "autoPrompt"));
     try {
-      // v1.2.1：快照缓存（forceSnap=true 时强制重读，例如刚存完主世界）
-      if (forceSnap || !statusSnapCache) {
+      // v1.2.7（性能 + 第六轮盲审 G-1）：
+      // ① 允许调用方直接传入刚生成的快照对象 —— 存主世界 / 设为基准之后不必再把
+      //    整份快照（本机实测 8.8MB）重新下载 + 同步解析一遍，只为刷新一行差异数。
+      // ② 需要重读时先把缓存清空再读：原来 parseSnapshot 抛错时赋值语句根本不执行，
+      //    上一次的旧快照会留在缓存里，之后不带参数刷新就拿旧基准算差异还显示得好好的。
+      if (snapOverride && typeof snapOverride === "object" && Array.isArray(snapOverride.settings)) {
+        statusSnapCache = snapOverride;
+      } else if (snapOverride || !statusSnapCache) {
+        statusSnapCache = null;
         const text = await storageRead(MASTER_FILE);
         statusSnapCache = text ? parseSnapshot(text) : null;
       }
@@ -2134,6 +2234,7 @@ async function openSyncPanel() {
       const $ap = $h.find("#wsync-autoprompt");
       if ($ap.length) $ap.prop("checked", game.settings.get(MODULE_ID, "autoPrompt"));
     } catch (e) {
+      statusSnapCache = null;   // v1.2.7（G-1）：解析失败不留旧基准，宁可下次重读一次
       $s.html("<span class=\"wsync-status-none\">主世界基准读取失败：" + escapeHtml(e?.message || e) + "</span>");
     }
   }
