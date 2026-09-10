@@ -1,7 +1,33 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.1.0
+ * 世界同步装置 (lh-world-sync) v1.2.0
  * ----------------------------------------------------------------------------
  * 功能：把一个世界当作「主世界」保存配置快照；新世界一键读回。
+ * v1.2.0：采纳审阅里我上一轮以「保守」为由拒绝的两条建议（现已按审阅意见改回，
+ *   并各留一层兜底），外加系统声明放开：
+ *   ① 侧边栏按钮不再永久轮询。原实现 setInterval(1500ms) 常驻查 DOM，审阅第 12 条
+ *      认为该用官方渲染 hook。现改为 hook 驱动 —— hook 名 renderSidebar 的来历：
+ *      ApplicationV2 渲染后按「render + 类名」派发（client/applications/api/
+ *      application.mjs:1226-1233 #callHooks：Hooks.callAll(hookName.replace("{}",
+ *      cls.name), ...)，render 事件的 hookName 为 "render"，见同文件:523），
+ *      侧边栏类名 Sidebar（client/applications/sidebar/sidebar.mjs:23
+ *      export default class Sidebar extends HandlebarsApplicationMixin(ApplicationV2)）
+ *      → hook 名即 "renderSidebar"；另挂 sidebar.mjs:250 的 changeSidebarTab
+ *      （切 tab 时 Hooks.callAll("changeSidebarTab", ui[tab])）。
+ *      ⚠ 时机：侧边栏渲染发生在 ready 之前（client/game.mjs:772 initializeUI()，
+ *      而 :787 才 Hooks.callAll("ready")；:992 ui.sidebar.render({force:true})），
+ *      所以两个 Hooks.on 必须写在模块加载期（文件顶层），不能等 ready 再注册。
+ *      兜底：万一两个 hook 都错过，做有限次重试（1 秒 × 最多 8 次，挂上即停），
+ *      全文件不再有任何常驻定时器。
+ *   ② 回档账本改为「每世界一个文件」apply-log-<worldId>.json。原先把所有世界写进
+ *      同一个 apply-log.json —— v1.0.9 虽已按 worldId 分区，但仍要读整份文件、
+ *      写入时还会重写别的世界的记录。现在只读自己那个文件、只写自己那个文件，
+ *      世界之间物理隔离。旧文件 apply-log.json 只读不写也不删（一次性兼容：
+ *      本世界条目若只存在于旧文件里，仍能读到并用于回档；迁移完成后由用户自行删除）。
+ *   ③ 系统声明放开：module.json 的 relationships.systems 改为 []。原声明
+ *      dnd5e 5.3.3 会让其他系统（如 PF2e）的世界把本模块从「启用模组」列表里
+ *      直接过滤掉（官方依据：public/scripts/foundry.mjs:109351-109352 —— 声明了
+ *      systems 且当前系统不在其中即 return arr 剔除）。本模块只读写 world 级
+ *      Setting，与具体游戏系统无关。
  * v1.1.0：按外部代码审阅（12 条）逐条核验后修复（核验结论：11 条属实，1 条已
  *   在 v1.0.9 修掉）。本轮改动：
  *   ① 【会出错】新世界漏恢复。模块勾选列表原先只由「当前世界已有的 Setting」
@@ -91,14 +117,21 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.1.0";
+const MODULE_VERSION = "1.2.0";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
 // 快照文件（固定名覆盖写，游戏内无删除 API，旧文件不清理）
 const STORAGE_DIR = "modules/lh-world-sync/storage";
 const MASTER_FILE = "world-snapshot-master.json";
-const APPLOG_FILE = "apply-log.json";
+// 回档账本文件名（v1.2.0 起每世界一个文件，只读自己那个、只写自己那个）。
+// worldId 本身是 16 位字母数字，这里再做一次白名单过滤：currentWorldId() 在
+// world.id 缺失时会退回世界标题（可能含空格/中文/斜杠），直接拿来拼文件名会非法。
+const APPLOG_FILE_LEGACY = "apply-log.json"; // v1.0.9–v1.1.0 的合并账本：只读兼容，不写也不删
+function applyLogFile() {
+  const safe = currentWorldId().replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
+  return "apply-log-" + (safe || "unknown") + ".json";
+}
 // 回档账本 schema 2（v1.0.9）：账本按世界分区，A/B 世界不再互相覆盖
 const APPLOG_SCHEMA = 2;
 // 操作锁（v1.1.0）：两个 GM 同时恢复时，后进入者被拒。
@@ -445,17 +478,34 @@ function describeChange(from, to) {
 // { schema: 2, worlds: { "<worldId>": { ts, worldId, worldTitle, appVersion, prev } } }
 // prev = { key: { present, value } }；present:false 表示该键在恢复前并不存在。
 function emptyApplyLogStore() { return { schema: APPLOG_SCHEMA, worlds: {} }; }
-// 读整个账本容器。旧版单条格式（无 schema/worlds）一律不认领：
-// 宁可不回档，也不能把来源不明的旧值写进当前世界。
+// 读整个账本容器。文件 = apply-log-<worldId>.json（只可能含本世界一格）。
+// 兼容：新文件不存在时，从旧版合并账本 apply-log.json 里取本世界那一格
+// （只读不写；下次恢复会落到新文件，旧文件保持原样由用户自行删除）。
 async function readApplyLogStore() {
-  const text = await storageRead(APPLOG_FILE);
-  if (!text) return emptyApplyLogStore();
-  try {
-    const raw = JSON.parse(text);
-    if (raw && raw.schema === APPLOG_SCHEMA && raw.worlds && typeof raw.worlds === "object") return raw;
-    console.warn("[lh-world-sync] 检测到旧格式账本（无世界分区），已忽略，不再作为回档依据");
+  const text = await storageRead(applyLogFile());
+  if (text) {
+    try {
+      const raw = JSON.parse(text);
+      if (raw && raw.schema === APPLOG_SCHEMA && raw.worlds && typeof raw.worlds === "object") return raw;
+      console.warn("[lh-world-sync] 本世界账本文件格式异常，已忽略（不作为回档依据）");
+    } catch (e) {
+      console.warn("[lh-world-sync] 本世界账本文件解析失败，已忽略（不作为回档依据）", e);
+    }
     return emptyApplyLogStore();
-  } catch (e) { return emptyApplyLogStore(); }
+  }
+  const legacy = await storageRead(APPLOG_FILE_LEGACY);
+  if (legacy) {
+    try {
+      const raw = JSON.parse(legacy);
+      const wid = currentWorldId();
+      if (raw && raw.schema === APPLOG_SCHEMA && raw.worlds?.[wid]) {
+        console.log("[lh-world-sync] 已从旧版合并账本 " + APPLOG_FILE_LEGACY + " 读到本世界的回档记录；"
+          + "下次恢复起写入 " + applyLogFile() + "，旧文件保留不动，确认无误后可手动删除。");
+        return { schema: APPLOG_SCHEMA, worlds: { [wid]: raw.worlds[wid] } };
+      }
+    } catch (e) { /* 旧文件损坏与本世界无关，忽略 */ }
+  }
+  return emptyApplyLogStore();
 }
 // 写入时只覆盖「本世界」那一格，其他世界的记录原样保留
 async function writeApplyLog(prevMap, afterMap) {
@@ -473,7 +523,7 @@ async function writeApplyLog(prevMap, afterMap) {
     after: afterMap ? Object.fromEntries([...afterMap.entries()]) : {},
     prev: Object.fromEntries([...prevMap.entries()].map(([k, v]) => [k, { present: v.present, value: v.value }]))
   };
-  await storageWrite(APPLOG_FILE, JSON.stringify(store, null, 2));
+  await storageWrite(applyLogFile(), JSON.stringify(store, null, 2));
 }
 // 回档成功后就地标记（审阅第 8 条：原实现可无限重复回档，几天后再点一次仍写旧值）
 async function markLogRolledBack() {
@@ -483,7 +533,7 @@ async function markLogRolledBack() {
   if (!e) return;
   e.status = "rolled-back";
   e.rolledBackAt = new Date().toISOString();
-  await storageWrite(APPLOG_FILE, JSON.stringify(store, null, 2));
+  await storageWrite(applyLogFile(), JSON.stringify(store, null, 2));
 }
 // 回档前自检：哪些键在「上次恢复之后」又被人改过（当前值 ≠ 账本记的 after）
 function findDriftedKeys(log) {
@@ -1250,22 +1300,45 @@ Hooks.once("ready", () => {
   setTimeout(() => { autoPromptCheck().catch(e => console.error("lh-world-sync autoprompt", e)); }, 6000);
 });
 
-/* ============================ 侧边栏按钮（常驻轮询，挂在「设置」后） ============================ */
+/* ============================ 侧边栏按钮（官方渲染 hook，挂在「设置」后） ============================ */
+// hook 名 renderSidebar 的出处：ApplicationV2 渲染结束后按「render + 类名」派发 hook
+// （client/applications/api/application.mjs:1226-1233 #callHooks：
+//  Hooks.callAll(hookName.replace("{}", cls.name), this, ...)，其中 render 事件的
+//  hookName 为 "render"，见同文件 :523；侧边栏类名 Sidebar 见
+//  client/applications/sidebar/sidebar.mjs:23），故 hook 名 = "renderSidebar"。
+// 另外 sidebar.mjs:250 在切 tab 时 Hooks.callAll("changeSidebarTab", ui[tab])，一并监听。
+// ⚠ 这两个 Hooks.on 必须在模块加载期注册：侧边栏渲染早于 ready
+//   （client/game.mjs:772 initializeUI() / :992 ui.sidebar.render()，而 :787 才
+//    Hooks.callAll("ready")），等 ready 再注册会错过首次渲染。
 let wsyncBtnLogged = false;
-function ensureSidebarButton() {
-  setInterval(() => {
-    // 锚点 = 右侧边栏 tab 区「设置」齿轮按钮（templates/sidebar/tabs.hbs：button[data-tab="settings"]）
-    const $anchor = $("button[data-tab=\"settings\"]").first();
-    if (!$anchor.length) return;
-    if ($("#" + BTN_ID).length) return;
-    const $li = $(`<li><button id="${BTN_ID}" type="button" class="ui-control plain icon ${BTN_ICON}" title="世界同步装置" aria-label="世界同步装置"></button></li>`);
-    $li.find("button").on("click", () => openSyncPanel());
-    $anchor.closest("li").after($li);
-    if (!wsyncBtnLogged) {
-      wsyncBtnLogged = true;
-      console.log("lh-world-sync: 侧边栏按钮已挂载（常驻巡查，设置齿轮后） v" + MODULE_VERSION);
-    }
-  }, 1500);
+function mountSidebarButton() {
+  // 锚点 = 右侧边栏 tab 区「设置」齿轮按钮（templates/sidebar/tabs.hbs：button[data-tab="settings"]）
+  const $anchor = $("button[data-tab=\"settings\"]").first();
+  if (!$anchor.length) return false;
+  if ($("#" + BTN_ID).length) return true;
+  const $li = $(`<li><button id="${BTN_ID}" type="button" class="ui-control plain icon ${BTN_ICON}" title="世界同步装置" aria-label="世界同步装置"></button></li>`);
+  $li.find("button").on("click", () => openSyncPanel());
+  $anchor.closest("li").after($li);
+  if (!wsyncBtnLogged) {
+    wsyncBtnLogged = true;
+    console.log("lh-world-sync: 侧边栏按钮已挂载（renderSidebar hook，设置齿轮后） v" + MODULE_VERSION);
+  }
+  return true;
+}
+Hooks.on("renderSidebar", () => { if (game.user?.isGM) mountSidebarButton(); });
+Hooks.on("changeSidebarTab", () => { if (game.user?.isGM) mountSidebarButton(); });
+// 兜底：仅当两个 hook 都错过时（例如侧边栏在模块代码执行前就已渲染完）才会用到。
+// 有限次重试、挂上即停 —— 不是常驻轮询。
+const BTN_RETRY_MAX = 8;
+function ensureSidebarButton(attempt = 0) {
+  if (!game.user?.isGM) return;
+  if (mountSidebarButton()) return;
+  if (attempt >= BTN_RETRY_MAX) {
+    console.warn("lh-world-sync: 侧边栏按钮未挂载（锚点 button[data-tab=\"settings\"] 未出现），"
+      + "仍可从「设置 → 模组设置 → 世界同步装置面板」进入。");
+    return;
+  }
+  setTimeout(() => ensureSidebarButton(attempt + 1), 1000);
 }
 
 /* ============================ 设置菜单入口 ============================ */

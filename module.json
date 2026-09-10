@@ -2,7 +2,7 @@
   "id": "lh-world-sync",
   "title": "世界同步装置",
   "description": "将某个世界保存为主世界基准快照，新世界可一键恢复。支持按模块细调恢复范围、差异查看、进入世界自动提醒、快照文件导入导出，以及一键回档（可查看每次恢复改动了哪些设置）。",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "authors": [
     {
       "name": "LH",
@@ -22,16 +22,7 @@
   "persistentStorage": true,
   "socket": false,
   "relationships": {
-    "systems": [
-      {
-        "id": "dnd5e",
-        "type": "system",
-        "compatibility": {
-          "minimum": "5.3.3",
-          "verified": "5.3.3"
-        }
-      }
-    ]
+    "systems": []
   },
   "url": "https://github.com/Ryuka16/lh-world-sync",
   "manifest": "https://raw.githubusercontent.com/Ryuka16/lh-world-sync/main/module.json",
