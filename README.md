@@ -53,7 +53,7 @@ https://raw.githubusercontent.com/Ryuka16/lh-world-sync/main/module.json
 {
   "schema": 1,
   "app": "lh-world-sync",
-  "appVersion": "1.3.1",
+  "appVersion": "1.3.2",
   "sourceWorld": "主世界名",
   "savedAt": "ISO 时间",
   "systemId": "dnd5e",
@@ -76,7 +76,7 @@ https://raw.githubusercontent.com/Ryuka16/lh-world-sync/main/module.json
       "ts": "ISO 时间",
       "worldId": "<worldId>",
       "worldTitle": "世界显示名",
-      "appVersion": "1.3.1",
+      "appVersion": "1.3.2",
       "status": "pending",
       "rolledBackAt": null,
       "after": { "<设置键>": "…本次恢复写入的值…" },
@@ -114,6 +114,12 @@ https://raw.githubusercontent.com/Ryuka16/lh-world-sync/main/module.json
 - **并发保护**：两个 GM 同时做世界同步操作（恢复 / 存主世界 / 回档 / 导入设为主快照）时，后一个会被拒绝并提示；同一个浏览器会话里的重复点击也会被挡住（文件锁对同一会话是放行的，所以另加了一道会话内的闸）。锁里同时记录了**会话标识**与**页面标识**：如果你在操作进行中刷新了页面，新页面不会把上一个页面的锁当成自己的——它会明确提示「你刚刷新过，上一次操作可能还在跑」，而不是放行（这是 v1.2.8 修掉的一条会丢失撤销点的路）。锁写在 `storage/operation-lock.json`，**约 2 分钟**未释放自动失效（持有者崩溃也不会死锁）。⚠ 文件锁不是原子操作，属尽力而为，不适合多人高频同时恢复的场景；**当锁文件读不到或写不进时（服务器故障 / 目录权限变更），本模块会明确提示「本次未做互斥检查」**——v1.3.1 之前这种情况是静默跳过互斥的，界面看不出任何异常，而两个 GM 同时恢复会互相覆盖撤销点。
 - **快照校验**：导入时校验 `app` / `schema` / 键类型 / **value 字段是否存在** / 重复键 / 条目数上限 / `modules` 结构，非法文件直接拒绝；系统版本、Foundry 版本、缺失模组只作**提示**（列出差异后由你决定是否继续）。恢复时**会跳过本机未安装模组的设置键**（避免产生没人读、却会随快照在服务器之间复制的悬空键）。
 - **写入口守卫**：所有写操作（恢复、回档、写入主快照）执行前统一检查 GM 身份，`window.lhWorldSync` 接口同样受限。
+
+### v1.3.2 变更
+
+- **把 `world` 从误判里摘出来**：`world` 是「世界自己的命名空间」——世界脚本、世界宏、小游戏用 `game.settings.register` 时不写模块 id，键就落在 `world.*` 下。旧判据把它当成「一个叫 world 的模组没装」，于是面板上冒出一个世上不存在的模块名。现在它与 `core`、当前系统同列白名单，永远可写。
+- **把「没有安装」这句话说准**：相关文案统一为「本机没有安装这个模组（多为以前卸载后残留的设置）」，并在提示里说清机制——**Foundry 卸载模块只删 `Data/modules/<id>` 那个文件夹，不碰世界设置**（官方 `Package.uninstall()` 只做三件事：递归删目录、从内存包列表移除、重评可用性，函数体里没有一处 `Setting.delete` / `deleteDocuments`）。所以列表里出现老模组的名字是正常的残留，不是它以为你装过。
+- 涉及文案位置：面板勾选行的「本机没有 · 不会恢复」、状态栏的「N 项未参与比较」、恢复报告的「另有 N 项没有恢复」、差异提示、快照兼容性提示。
 
 ### v1.3.1 变更
 

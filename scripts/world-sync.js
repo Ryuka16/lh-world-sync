@@ -1,5 +1,22 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.3.1
+ * 世界同步装置 (lh-world-sync) v1.3.2
+ * ----------------------------------------------------------------------------
+ * v1.3.2：把「本机没装这个模组」这句话说准，并把 world 从误判里摘出来。
+ *   起因：用户在面板上看到 ActiveAuras / aeris-tokens / bg3-inspired-hotbar 这些
+ *   **早就卸载了**的模组，问「它连我删掉的模组都知道？还写未安装这个 mod」。
+ *   ① 真相：Foundry 卸载模块只删 Data/modules/<id> 那个文件夹，**不碰世界设置**
+ *      （官方 Package.uninstall() 只做三件事：递归删目录、从内存包列表移除、
+ *      重评可用性；函数体里没有一处 Setting.delete / deleteDocuments）。
+ *      所以「模块没了、设置还在」是设计使然 —— 用户世界里实测残留 141 项。
+ *      面板列的不是模块清单，而是「世界设置里出现过的命名空间」，
+ *      「没有安装」是抄完之后才贴上去的标签，不是它以为你装过。
+ *   ② 【真误判 · 本次修复】`world` 被当成「一个叫 world 的模组没装」。世界脚本 /
+ *      世界宏 / 小游戏用 game.settings.register 时不写模块 id，键就落在 world.* 下
+ *      （用户世界上有 10 项：breakout-leaderboard-v2 / origNamesMap 等）。它其实
+ *      永远可写，必须与 core / 当前系统同列白名单 → nsIsUnavailable() 加分支。
+ *   ③ 相关文案统一口径：「本机没有安装这个模组（多为以前卸载后残留的设置）」，
+ *      取代原来的「未安装」；面板行 / 状态栏 / 恢复报告 / 差异提示 / 快照兼容性
+ *      提示五处一致，并说明「卸载只删程序不删设置」。
  * ----------------------------------------------------------------------------
  * v1.3.1：第八轮「整体盲审」的第三视角（**对抗破坏者**：专门找「永久失去 /
  *   写坏世界 / 永远卡住 / 假防护」）报出 12 条，加上「文档对现实」视角的核对，
@@ -366,7 +383,7 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.3.1";
+const MODULE_VERSION = "1.3.2";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
@@ -1038,7 +1055,7 @@ function describeSnapshotCompat(snap) {
   if (snapMods.length) {
     const missing = snapMods.filter(id => !game.modules.get(id));
     const inactive = snapMods.filter(id => { const m = game.modules.get(id); return m && !m.active; });
-    if (missing.length) notes.push(`快照里有 <b>${missing.length}</b> 个模组当前服务器未安装（${escapeHtml(missing.slice(0, 5).join("、"))}${missing.length > 5 ? " 等" : ""}）`);
+    if (missing.length) notes.push(`快照里有 <b>${missing.length}</b> 个模组本机没有安装（多为以前卸载后残留的设置）：${escapeHtml(missing.slice(0, 5).join("、"))}${missing.length > 5 ? " 等" : ""}）`);
     if (inactive.length) notes.push(`快照里有 <b>${inactive.length}</b> 个模组当前是关闭状态`);
   }
   return notes;
@@ -1400,9 +1417,14 @@ function nsIsUnavailable(ns) {
   const n = String(ns ?? "");
   if (!n) return false;
   if (n === "core") return false;                  // 核心设置永远可写
+  // v1.3.2：world 是「世界自己的命名空间」，不是模组。
+  // 世界脚本 / 世界宏 / 小游戏用 game.settings.register 时若不写模块 id，键就落在 world.* 下。
+  // 旧判据把它当成「一个叫 world 的模组没装」→ 面板上冒出一个世上不存在的模块名，
+  // 而它其实永远可写（跟着世界走），必须与 core / 当前系统同列白名单。
+  if (n === "world") return false;
   if (n === MODULE_ID) return true;                // 本模块自指键：导出已排除，也不该写入
   if (n === game.system?.id) return false;         // 当前系统的设置
-  return !game.modules?.get(n);                    // 未安装的模组
+  return !game.modules?.get(n);                    // 未安装的模组（含卸载后残留的设置）
 }
 function isNsUnavailable(key) {
   return nsIsUnavailable(String(key ?? "").split(".")[0]);
@@ -1438,8 +1460,10 @@ function unavailableMods(keys) {
 function describeUnavailable(keys) {
   const mods = unavailableMods(keys);
   const tail = mods.length > 5 ? " 等 " + mods.length + " 个模组" : "";
-  return "另有 " + keys.length + " 项设置没有恢复：本世界没有安装对应的模组（"
-    + escapeHtml(mods.slice(0, 5).join("、")) + tail + "）。装好这些模组后再来恢复即可。";
+  return "另有 " + keys.length + " 项设置没有恢复：它们属于本世界没有安装的模组（"
+    + escapeHtml(mods.slice(0, 5).join("、")) + tail
+    + "）—— 多数是你以前装过、后来卸载的模组。卸载只删程序不删设置，那些设置一直留在世界里。"
+    + "哪天把模组装回来，再恢复即可。";
 }
 async function applySnapshot(snap, selection, precomputed) {
   // 写入口守卫（审阅第 10 条）：window.lhWorldSync.applySnapshot 对所有人生效
@@ -1573,7 +1597,7 @@ async function applySnapshot(snap, selection, precomputed) {
     // v1.2.5：快照里有「本机未安装模组」的设置时必须说出来 —— 否则用户会觉得
     // 「恢复完了怎么还是不对」，却不知道原因是没有那几项。
     if (unavailable.length) {
-      console.warn("[lh-world-sync] 有 " + unavailable.length + " 项设置未参与恢复：本机未安装对应模组 —— "
+      console.warn("[lh-world-sync] 有 " + unavailable.length + " 项设置未参与恢复：本机没有安装对应模组（多为以前卸载后残留的设置）—— "
         + unavailableMods(unavailable).join("、"));
       notify.warn(describeUnavailable(unavailable));
     }
@@ -1771,14 +1795,14 @@ function nsCheckboxListHTML(snapNs, pref) {
     // UI 承诺与行为不符。这里直接把这一行标成不可用，别让人去踩。
     const off = nsIsUnavailable(n);
     const checked = mode === "all" ? true : !!pref?.ns?.[n];
-    const cnt = off ? "本机未安装 · 不会恢复" : (fromSnap ? "来自主快照" : (curCount[n] + " 键"));
+    const cnt = off ? "本机没有 · 不会恢复" : (fromSnap ? "来自主快照" : (curCount[n] + " 键"));
     const label = escapeHtml(n)
       + (friendly ? `<em class="wsync-ns-title">${escapeHtml(friendly)}</em>` : "")
       + (off
-        ? `<em class="wsync-ns-title">（本机未安装这个模组 · 本次不会恢复）</em>`
+        ? `<em class="wsync-ns-title">（本机没有这个模组 · 本次不会恢复）</em>`
         : (fromSnap ? `<em class="wsync-ns-title">（当前世界还没有它的设置 · 来自主快照）</em>` : ""));
     return `
-    <label class="wsync-ns-row${off ? " wsync-ns-off" : ""}"${off ? ` title="本机未安装这个模组：它的设置不会被创建（避免留下没有任何代码会去读的悬空键）"` : ""}>
+    <label class="wsync-ns-row${off ? " wsync-ns-off" : ""}"${off ? ` title="本机没有安装这个模组（很可能是以前卸载后留下的设置）。它的设置不会被创建 —— 避免在本世界留下一堆没有任何代码会去读的悬空键。重装该模组后即可恢复。"` : ""}>
       <input type="checkbox" data-ns="${escapeHtml(n)}" value="${escapeHtml(n)}"${checked ? " checked" : ""}>
       <span class="wsync-ns-name">${label}</span>
       <span class="wsync-ns-count">${cnt}</span>
@@ -1968,7 +1992,7 @@ async function proceedApplySnap(changed) {
       // v1.2.5：区分「真的没有差异」与「有差异但全被跳过（本机没装那些模组）」——
       // 后者说成「基准一致」是假话，而且会让用户以为已经恢复过了。
       if (res.skipped) {
-        notify.warn("没有可恢复的项：快照里有 " + res.skipped + " 项属于本世界未安装的模组，未参与恢复。装好对应的模组后再恢复。");
+        notify.warn("没有可恢复的项：快照里有 " + res.skipped + " 项属于本世界没有安装的模组（多为以前卸载后残留的设置），未参与恢复。把模组装回来再恢复即可。");
       } else {
         notify.ok("当前世界与主世界基准一致，无需恢复。");
       }
@@ -1996,7 +2020,7 @@ function openApplyReportDialog(applied, skipped) {
   // 不进报告、不进「上一次恢复改动了什么」—— 刷新之后这句话就消失了。
   // 报告是用户事后唯一能回看的凭据，缺这项就等于没说过。
   const skippedNote = skipped
-    ? `<div class="wsync-diff-more">另有 <b>${skipped}</b> 项没有恢复：本世界没有安装对应的模组。装好之后再恢复即可。</div>`
+    ? `<div class="wsync-diff-more">另有 <b>${skipped}</b> 项没有恢复：它们属于本世界没有安装的模组（多为以前卸载后残留的设置）。把模组装回来再恢复即可。</div>`
     : "";
   const lines = applied.slice(0, 150).map(c => {
     const tag = describeChange(c.from, c.to);
@@ -2056,7 +2080,7 @@ function openLastReportDialog() {
   const lines = items.map(it => `<div class="wsync-diff-row"><code>${escapeHtml(it.k)}</code><span class="wsync-diff-tag">${escapeHtml(it.tag || "")}</span><div class="wsync-diff-vals"><span class="wsync-v-now">${escapeHtml(it.from ?? "")}</span><span class="wsync-v-master">→</span><span class="wsync-v-now">${escapeHtml(it.to ?? "")}</span></div></div>`).join("");
   const trimmed = rep.n > items.length ? `<div class="wsync-diff-more">…还有 ${rep.n - items.length} 项（这里只回看最近 200 项）</div>` : "";
   // v1.2.6（第四轮盲审 T4）：回看清单里也要有「另有 N 项没恢复」，否则事后再看就觉得全恢复了。
-  const skippedNote = rep.skipped ? `<div class="wsync-diff-more">另有 <b>${rep.skipped}</b> 项没有恢复：本世界没有安装对应的模组。</div>` : "";
+  const skippedNote = rep.skipped ? `<div class="wsync-diff-more">另有 <b>${rep.skipped}</b> 项没有恢复：本世界没有安装对应的模组（多为以前卸载后残留的设置）。</div>` : "";
   new Dialog({
     title: "上一次恢复改动了什么",
     content: `<div class="wsync-body"><div class="wsync-diff-summary">共改动 <b>${rep.n}</b> 项 · 记录时间 ${escapeHtml(formatTs(rep.at))}<br>这份清单存在本浏览器会话里，刷新页面后仍可回看；关闭标签页后清空。</div>${skippedNote}${lines}${trimmed}</div>`,
@@ -2708,7 +2732,7 @@ async function openSyncPanel() {
       const un = collectUnavailable(snap, sel);
       const unMods = unavailableMods(un);
       const unHTML = un.length
-        ? `<br><span class="wsync-status-none">另有 ${un.length} 项未参与比较：本世界没有安装对应的模组（${escapeHtml(unMods.slice(0, 5).join("、"))}${unMods.length > 5 ? " 等 " + unMods.length + " 个模组" : ""}）。</span>`
+        ? `<br><span class="wsync-status-none">另有 ${un.length} 项未参与比较：本世界没有安装对应的模组（多为以前卸载后残留的设置：${escapeHtml(unMods.slice(0, 5).join("、"))}${unMods.length > 5 ? " 等 " + unMods.length + " 个模组" : ""}）。</span>`
         : "";
       $s.html((diff.changed.length
         ? `当前世界与主世界基准存在 <b class="wsync-diff-has">${diff.changed.length}</b> 处差异（${scopeNote}）。<br>${base}`
