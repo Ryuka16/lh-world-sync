@@ -1,7 +1,28 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.2.5
+ * 世界同步装置 (lh-world-sync) v1.2.6
  * ----------------------------------------------------------------------------
  * 功能：把一个世界当作「主世界」保存配置快照；新世界一键读回。
+ * v1.2.6：第五轮 —— 对 v1.2.5 那次修复本身做的独立盲审（v1.2.5 的 6 组声明里
+ *   3 组完全修好、2 组只落一半、1 组引入新问题；新增 2 条严重、5 条一般、6 条建议）。
+ *   本轮的主线是「同一件事在不同路径上说法不一致」：
+ *   ① 【严重】账本读错误需要分级。v1.2.5 把「旧版合并账本 apply-log.json 读失败」也记进了
+ *      applyLogReadError，而那个文件**只读不写**。后果：服务器对一份永远不会被写的文件
+ *      持续报错时，用户的每一次恢复都被中止，理由还是错的（「为避免覆盖本世界原有的
+ *      回档记录」）。修法：legacy 读失败单独记进 legacyLogReadError，只影响回档提示。
+ *   ② 【严重】回档路径与该规则相反：主账本读失败、旧账本却读到了条目时就照常回档 ——
+ *      用可能过期的旧值覆盖世界，还会把主账本里更新的那条标成「已回档」，污染撤销点语义。
+ *      现在与写入路径对齐：主账本读失败一律拒绝回档。
+ *   ③ 「有 N 项因缺模组没恢复」口径与实现不符：旧实现拿**整份快照**统计，既不看勾选范围、
+ *      也不看排除键，只勾一个模块也报「另有 250 项未恢复」，还把 core.time 这类故意永不
+ *      恢复的键算了进去。抽出 collectUnavailable()（三条件：非排除键 + 模组没装 + 在勾选
+ *      范围内），面板早退 / 文件导入 / 自动提醒 / 状态栏 / 写入后通知五处共用同一口径。
+ *   ④ 差异为空时一律说「一致」——掩盖了「能恢复的已一致、另有 N 项从未落地」这种情形
+ *      （跨服务器搬家的主场景）。三处早退现在分开说；状态栏也补上这一行。
+ *   ⑤ 面板勾选列表把「本机没装的模组」显示成可勾选，勾了却不生效（UI 承诺与行为不符）→ 标灰。
+ *   ⑥ 「面板不再读两次快照」引入了陈旧缓存：解析失败时旧缓存不清，状态栏拿上一次的基准算差异。
+ *   ⑦ 死代码与静默失效：跳过键的中间变量全文件没人读、账本格式异常被静默当空后覆盖、
+ *      「已回档过」标记失败时不吭声、「另有 N 项没恢复」只活在瞬时通知里（刷新即消失）。
+ *   ⑧ finally 里先放闸后放锁 → 同标签页的下一个操作可能被上一个的释放动作误删锁。
  * v1.2.5：第四轮 —— 对 v1.2.4 那次修复本身做的独立盲审（v1.2.4 的 15 条可核验声明里
  *   12 条修好、2 条只修一半、1 条引入新问题）。这一轮的头号发现是致命的：
  *   ① 【致命】v1.2.4 新增的「跳过本机未安装模组的键」只加在写入循环里，而记账循环
@@ -241,7 +262,7 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.2.5";
+const MODULE_VERSION = "1.2.6";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
@@ -462,7 +483,12 @@ let storageLastError = null;
 //   ① 给用户看：读失败不能说成「本世界暂无可回档记录」（错误因果，会让人以为撤销点没了）；
 //   ② 给写路径用：读失败时绝不能照写覆盖 —— 账本里存的是「上一次恢复前的值」，
 //      是用户点「回档」的唯一凭证，服务器上没有它的备份，覆盖即永失。
-let applyLogReadError = null;
+let applyLogReadError = null;      // 主账本 apply-log-<worldId>.json 本次读取失败的原因
+// v1.2.6（第四轮盲审 S2）：旧版合并账本 apply-log.json 读失败**单独记**。
+// 它只用于查旧撤销点，写新账本时永远不会覆盖它（第 257 行：只读不写）。
+// v1.2.5 把它记进 applyLogReadError，于是这份永远不写的文件一旦读不到，
+// 每一次恢复都会被中止，理由还是错的（「为避免覆盖本世界原有的回档记录」）。
+let legacyLogReadError = null;
 async function storageRead(name) {
   const url = foundry.utils.getRoute(norm(STORAGE_DIR) + "/" + name);
   let r;
@@ -832,6 +858,16 @@ async function readApplyLogStore() {
     } catch (e) {
       console.warn("[lh-world-sync] 本世界账本文件解析失败，已忽略（不作为回档依据）", e);
     }
+    // v1.2.6（第四轮盲审 T3）：格式不符/解析失败时，下面写账本会把这份文件**整份覆盖**。
+    // 将来若升 schema，旧记录就此静默消失（违反「旧数据只读不删」）。先原样另存一份再继续；
+    // 另存失败只告警，不阻断 —— 不能因为备份不了就让用户什么也做不了。
+    try {
+      const bak = applyLogFile().replace(/\.json$/i, "") + ".bak-" + Date.now() + ".json";
+      await storageWrite(bak, text);
+      console.warn("[lh-world-sync] 原账本格式不符，已原样另存为 " + bak + "（新账本将重新开始记）");
+    } catch (e2) {
+      console.warn("[lh-world-sync] 原账本另存失败（不影响后续操作，但旧记录会被覆盖）：" + (e2?.message || e2));
+    }
     return emptyApplyLogStore();
   }
   // v1.2.3：读不到文本时，区分「文件本来就没有」和「有文件但这次没读成」。
@@ -843,7 +879,16 @@ async function readApplyLogStore() {
   const legacy = await storageRead(APPLOG_FILE_LEGACY);
   // v1.2.5：旧版合并账本读失败也要记下来 —— 否则这种情形会走「没有可回档记录」，
   // 而那个文件里可能还存着本世界的撤销点（与主账本读失败同类的错误因果）。
-  if (!legacy && storageLastError && !applyLogReadError) applyLogReadError = storageLastError;
+  // v1.2.6（第四轮盲审 S2）：旧账本读失败记进 legacyLogReadError，**不能**记进
+  // applyLogReadError —— 后者是「写新账本会不会覆盖掉旧记录」的判据，而
+  // apply-log.json 全文件只读不写（第 257 行声明，唯一读点就是上面这行）。
+  if (!legacy && storageLastError) {
+    legacyLogReadError = storageLastError;
+    console.warn("[lh-world-sync] 旧版合并账本 " + APPLOG_FILE_LEGACY + " 读取失败（" + storageLastError
+      + "）。它只用于查旧的回档记录，不影响本次恢复；若其中还存着本世界的撤销点，这次会看不到它。");
+  } else {
+    legacyLogReadError = null;
+  }
   if (legacy) {
     try {
       const raw = JSON.parse(legacy);
@@ -888,7 +933,15 @@ async function markLogRolledBack() {
   const store = await readApplyLogStore();
   const wid = currentWorldId();
   const e = store.worlds?.[wid];
-  if (!e) return;
+  // v1.2.6（第四轮盲审 T2）：读失败/条目缺失时原来静默 return —— 账本状态停在 pending，
+  // 用户下次可以毫无警告地二次回档（v1.1.0 第 8 条「已回档过一次」的防护正好在这一刻失效）。
+  // 防护可以失效，但不能悄无声息地失效。
+  if (!e) {
+    console.warn("[lh-world-sync] 未能在账本里标下「已回档过」"
+      + (applyLogReadError ? "（账本读取失败：" + applyLogReadError + "）" : "（账本里没有本世界的条目）")
+      + "。下次回档可能不会提示「已经回档过一次」。");
+    return;
+  }
   e.status = "rolled-back";
   e.rolledBackAt = new Date().toISOString();
   await storageWrite(applyLogFile(), JSON.stringify(store, null, 2));
@@ -936,13 +989,46 @@ function keepSelfEnabled(key, val) {
 // 因此「写入」「差异计算」「账本记账」三处必须共用同一个判据 —— v1.2.4 只在写入路径
 // 用了它，于是差异永远存在（每次进世界弹提醒）、账本把没写的键记成「原本不存在」，
 // 回档时会去删一个用户后来才产生的配置（第三轮盲审判定为致命）。
+function nsIsUnavailable(ns) {
+  const n = String(ns ?? "");
+  if (!n) return false;
+  if (n === "core") return false;                  // 核心设置永远可写
+  if (n === MODULE_ID) return true;                // 本模块自指键：导出已排除，也不该写入
+  if (n === game.system?.id) return false;         // 当前系统的设置
+  return !game.modules?.get(n);                    // 未安装的模组
+}
 function isNsUnavailable(key) {
-  const ns = String(key ?? "").split(".")[0];
-  if (!ns) return false;
-  if (ns === "core") return false;                 // 核心设置永远可写
-  if (ns === MODULE_ID) return true;               // 本模块自指键：导出已排除，也不该写入
-  if (ns === game.system?.id) return false;        // 当前系统的设置
-  return !game.modules?.get(ns);                   // 未安装的模组
+  return nsIsUnavailable(String(key ?? "").split(".")[0]);
+}
+// v1.2.6（第四轮盲审 G1/G2）：统一口径的「本该恢复、却恢复不了的键」。
+// 三项条件同时满足才算，缺一项就是在虚报或误导：
+//   ① 不是用户明确排除的键（EXCLUDE_DEFAULT / 自制排除表里的是**故意**永不恢复）
+//   ② 所属模组本机没装（未启用但已安装的模组仍在 game.modules 里，不在此列）
+//   ③ 落在本次勾选范围内（用户自己没勾的模块，不叫「被跳过」）
+// 面板早退、文件导入早退、进世界自动提醒、状态栏、写入后的通知，五处共用同一个口径。
+function collectUnavailable(snap, selection) {
+  const sel = selection ?? { ns: {}, includeModuleConfig: false };
+  const out = [];
+  for (const item of (snap?.settings ?? [])) {
+    const key = String(item?.key ?? "");
+    if (!key || out.includes(key)) continue;
+    if (isExcludedKey(key)) continue;
+    if (!isNsUnavailable(key)) continue;
+    if (!sel?.ns?.[key.split(".")[0]]) continue;
+    out.push(key);
+  }
+  return out;
+}
+function unavailableMods(keys) {
+  return [...new Set((keys ?? []).map(k => String(k).split(".")[0]))];
+}
+// 一句话说清「有 N 项没恢复、为什么」——三个入口的文案必须一字不差，
+// 否则同一件事在不同弹窗里说法不同，用户会以为是两回事。
+function describeUnavailable(keys) {
+  const mods = unavailableMods(keys);
+  const tail = mods.length > 5 ? " 等 " + mods.length + " 个模组" : "";
+  return "另有 " + keys.length + " 项设置没有恢复：本世界没有安装对应的模组（"
+    + escapeHtml(mods.slice(0, 5).join("、")) + tail + "）。装好这些模组后再来恢复即可。";
 }
 async function applySnapshot(snap, selection, precomputed) {
   // 写入口守卫（审阅第 10 条）：window.lhWorldSync.applySnapshot 对所有人生效
@@ -950,10 +1036,10 @@ async function applySnapshot(snap, selection, precomputed) {
   // v1.2.5：统计「因本机未安装对应模组而不参与恢复」的键。
   // 它们已被 diffSnapshot 排除（否则会永远报差异、每次进世界弹提醒），
   // 所以这里单独从快照统计一次，好让提示与报告能说明「有 N 项没恢复」的原因。
-  const unavailable = [];
-  for (const item of (snap?.settings ?? [])) {
-    if (isNsUnavailable(item.key)) unavailable.push(item.key);
-  }
+  // v1.2.6（第四轮盲审 G1）：改用 collectUnavailable —— 旧写法拿整份快照统计，
+  // 既不看勾选范围、也不看排除键，于是「只勾一个模块」也报「另有 250 项未恢复」，
+  // 还把 core.time 这类故意永不恢复的键算了进去，口径与 README/头注释都不符。
+  const unavailable = collectUnavailable(snap, selection);
   // v1.2.1：允许调用方把弹窗里已经算好的清单原样传进来（自查第 8 项），
   // 让「用户看到的清单」与「实际写入的清单」是同一份，而不是各算一次。
   const diff = Array.isArray(precomputed) ? { changed: precomputed } : diffSnapshot(snap, selection);
@@ -988,7 +1074,6 @@ async function applySnapshot(snap, selection, precomputed) {
     //      把每个被跳过的键恒判为「又被改动过」，真漂移被噪声淹没。
     const updates = [];
     const creates = [];
-    const skippedNs = [];
     const plan = [];             // 本次真正会写入的差异项：账本、报告、回滚都以它为准
     for (const c of diff.changed) {
       // v1.2.2：文档是否存在一律问 getSettingDoc（不经过任何过滤），
@@ -1004,7 +1089,10 @@ async function applySnapshot(snap, selection, precomputed) {
       } else if (isNsUnavailable(c.key)) {
         // v1.2.4：本机没装的模组，不把它的设置键创建进本世界 —— 那些键没有任何
         // 代码会去读，却会被下一次「存主世界」收进快照，再传给别的世界：悬空键会自我复制。
-        skippedNs.push(c.key);
+        // v1.2.6：正常流程到不了这里（diffSnapshot 已把这类键滤掉），保留是为了挡住
+        // window.lhWorldSync 外部注入的 precomputed。原先它把键推进 skippedNs 后
+        // 全文件再没人读 —— 是死代码（第四轮盲审 T1），现在直接并进 unavailable。
+        if (!unavailable.includes(c.key)) unavailable.push(c.key);
       } else {
         creates.push({ key: c.key, user: null, value: json });
         plan.push(c);
@@ -1066,15 +1154,18 @@ async function applySnapshot(snap, selection, precomputed) {
     // v1.2.5：快照里有「本机未安装模组」的设置时必须说出来 —— 否则用户会觉得
     // 「恢复完了怎么还是不对」，却不知道原因是没有那几项。
     if (unavailable.length) {
-      const mods = [...new Set(unavailable.map(k => String(k).split(".")[0]))];
-      console.warn("[lh-world-sync] 有 " + unavailable.length + " 项设置未参与恢复：本机未安装对应模组 —— " + mods.join("、"));
-      notify.warn("另有 " + unavailable.length + " 项未恢复：本世界没有安装对应的模组（"
-        + escapeHtml(mods.slice(0, 5).join("、")) + (mods.length > 5 ? " 等" : "") + "）。");
+      console.warn("[lh-world-sync] 有 " + unavailable.length + " 项设置未参与恢复：本机未安装对应模组 —— "
+        + unavailableMods(unavailable).join("、"));
+      notify.warn(describeUnavailable(unavailable));
     }
-    return { applied: plan, skipped: unavailable.length };
+    return { applied: plan, skipped: unavailable.length, skippedKeys: unavailable };
   } finally {
-    endOp();                                  // v1.2.4：无论成败都放闸
+    // v1.2.6（第四轮盲审 G5）：先释放文件锁，再放会话闸 —— 顺序不能反。
+    // v1.2.5 是反的：endOp() 一放闸，同标签页的下一个操作立刻可以开始（withOpLock 会写自己的锁），
+    // 而本函数随后的 releaseLock 是「读 → 判归属 → 写 expiresAt:0」的非原子序列；
+    // 它若读到新操作的锁、写却发生在对方写之后，就把别人的锁抹成了已释放，第三方 GM 可趁虚而入。
     if (got?.lock) await releaseLock(got.lock);   // v1.2.5：没拿到锁就别瞎释放
+    endOp();                                      // v1.2.4：无论成败都放闸
   }
 }
 // 回档：按 applyLog 恢复
@@ -1084,8 +1175,18 @@ async function applySnapshot(snap, selection, precomputed) {
 async function rollbackApplyLog() {
   if (!assertGM()) return { denied: true };                   // assertGM 已提示过
   const log = await readApplyLog();
+  // v1.2.6（第四轮盲审 S1）：主账本读失败时**一律不许回档**，哪怕从旧版合并账本里凑出了条目。
+  // 那份数据可能已经过期（本世界的账本更新过、这次没读到），拿它批量覆盖世界 = 用旧值抹掉新值；
+  // 随后的 markLogRolledBack 还会把主账本里更新的那条标成「已回档」，撤销点语义被污染。
+  // 写入路径（writeApplyLog）早就是这样拒绝的，回档路径现在与它对齐。
+  if (applyLogReadError) return { readError: applyLogReadError };
   if (!log?.prev) {
-    return applyLogReadError ? { readError: applyLogReadError } : { empty: true };
+    // v1.2.6：主账本里没有本世界的条目、而旧版合并账本**读失败** —— 那也是「读不到」，
+    // 不等于「没有记录」：撤销点可能正存在那份读不到的文件里。
+    // （注意与 S1 的区别：上面那条是主账本**存在却读失败** → 一律拒绝回档；
+    //   这条是主账本本来就没有，此时 legacy 才是唯一来源，读失败要说成读失败。）
+    if (legacyLogReadError) return { readError: legacyLogReadError };
+    return { empty: true };
   }
   // 纵深防御：账本必须属于当前世界（readApplyLog 已按 worldId 只取本世界的格子，
   // 这里再核一次 worldId，防止将来改动绕过这道门）
@@ -1211,13 +1312,19 @@ function nsCheckboxListHTML(snapNs, pref) {
   const rows = all.map(n => {
     const friendly = nsFriendlyName(n);
     const fromSnap = !curNs.has(n);
+    // v1.2.6（第四轮盲审 G3）：本机没装这个模组时，它下面的键会被跳过（不会恢复），
+    // 旧界面却照常显示成可勾选 + 「来自主快照」—— 用户勾完点恢复，只得到一句「基准一致」，
+    // UI 承诺与行为不符。这里直接把这一行标成不可用，别让人去踩。
+    const off = nsIsUnavailable(n);
     const checked = mode === "all" ? true : !!pref?.ns?.[n];
-    const cnt = fromSnap ? "来自主快照" : (curCount[n] + " 键");
+    const cnt = off ? "本机未安装 · 不会恢复" : (fromSnap ? "来自主快照" : (curCount[n] + " 键"));
     const label = escapeHtml(n)
       + (friendly ? `<em class="wsync-ns-title">${escapeHtml(friendly)}</em>` : "")
-      + (fromSnap ? `<em class="wsync-ns-title">（当前世界还没有它的设置 · 来自主快照）</em>` : "");
+      + (off
+        ? `<em class="wsync-ns-title">（本机未安装这个模组 · 本次不会恢复）</em>`
+        : (fromSnap ? `<em class="wsync-ns-title">（当前世界还没有它的设置 · 来自主快照）</em>` : ""));
     return `
-    <label class="wsync-ns-row">
+    <label class="wsync-ns-row${off ? " wsync-ns-off" : ""}"${off ? ` title="本机未安装这个模组：它的设置不会被创建（避免留下没有任何代码会去读的悬空键）"` : ""}>
       <input type="checkbox" data-ns="${escapeHtml(n)}" value="${escapeHtml(n)}"${checked ? " checked" : ""}>
       <span class="wsync-ns-name">${label}</span>
       <span class="wsync-ns-count">${cnt}</span>
@@ -1412,7 +1519,7 @@ async function proceedApplySnap(changed) {
     }
     // 记录「刚才应用过」：刷新后跳过一轮自动提醒，避免弹窗自问自答
     try { sessionStorage.setItem("wsync.justApplied", Date.now()); } catch (e) {}
-    openApplyReportDialog(res.applied);
+    openApplyReportDialog(res.applied, res.skipped);
   } catch (e) {
     console.error(e);
     // v1.2.2：回滚失败就不能说「已自动回滚」—— 如实告知世界可能停在中间状态，
@@ -1426,8 +1533,14 @@ async function proceedApplySnap(changed) {
         : "恢复失败，已自动回滚到恢复前的状态：" + (e?.message || e));
   }
 }
-function openApplyReportDialog(applied) {
+function openApplyReportDialog(applied, skipped) {
   const hasModCfg = applied.some(c => c.key === "core.moduleConfiguration");
+  // v1.2.6（第四轮盲审 T4）：原来「另有 N 项未恢复」只出现在一条瞬时通知里，
+  // 不进报告、不进「上一次恢复改动了什么」—— 刷新之后这句话就消失了。
+  // 报告是用户事后唯一能回看的凭据，缺这项就等于没说过。
+  const skippedNote = skipped
+    ? `<div class="wsync-diff-more">另有 <b>${skipped}</b> 项没有恢复：本世界没有安装对应的模组。装好之后再恢复即可。</div>`
+    : "";
   const lines = applied.slice(0, 150).map(c => {
     const tag = describeChange(c.from, c.to);
     return `<div class="wsync-diff-row"><code>${escapeHtml(c.key)}</code><span class="wsync-diff-tag">${tag}</span><div class="wsync-diff-vals"><span class="wsync-v-now">${escapeHtml(shortVal(c.from))}</span><span class="wsync-v-master">→</span><span class="wsync-v-now">${escapeHtml(shortVal(c.to))}</span></div></div>`;
@@ -1435,13 +1548,13 @@ function openApplyReportDialog(applied) {
   const trimmed = applied.length > 150 ? `<div class="wsync-diff-more">…还有 ${applied.length - 150} 项</div>` : "";
   // v1.2.1：清单存进 sessionStorage —— 自动刷新之后仍能在面板里回看「上一次改了什么」，
   // 而不是刷完就查无此事（自查第 14 项：写操作要可核查、可撤销）。
-  saveLastReport(applied);
+  saveLastReport(applied, skipped);
   // v1.2.1：自动刷新延迟 10 秒（原来 3 秒，150 项清单根本来不及看），并给出手动选项
   const RELOAD_MS = 10000;
   const timer = setTimeout(() => window.location.reload(), RELOAD_MS);
   new Dialog({
     title: `恢复完成 · ${RELOAD_MS / 1000} 秒后自动刷新`,
-    content: `<div class="wsync-body"><div class="wsync-diff-summary">已恢复 <b>${applied.length}</b> 项设置。${hasModCfg ? "<b>模组启用状态已一并恢复</b>（此前被关闭的模组将重新启用）。" : ""}<br>页面将在 ${RELOAD_MS / 1000} 秒后自动刷新并生效。刷新完成后，仍可在面板里查看这次改动的清单。如需撤销，刷新完成后点「回档」。</div>${lines}${trimmed}</div>`,
+    content: `<div class="wsync-body"><div class="wsync-diff-summary">已恢复 <b>${applied.length}</b> 项设置。${hasModCfg ? "<b>模组启用状态已一并恢复</b>（此前被关闭的模组将重新启用）。" : ""}<br>页面将在 ${RELOAD_MS / 1000} 秒后自动刷新并生效。刷新完成后，仍可在面板里查看这次改动的清单。如需撤销，刷新完成后点「回档」。</div>${skippedNote}${lines}${trimmed}</div>`,
     buttons: {
       now: { icon: "<i class=\"fa-solid fa-rotate\"></i>", label: "立即刷新", callback: () => { clearTimeout(timer); window.location.reload(); } },
       later: { icon: "<i class=\"fa-solid fa-clock\"></i>", label: "稍后再刷新", callback: () => { clearTimeout(timer); notify.ok("已取消自动刷新。模组启用状态要下次刷新页面才生效。"); } },
@@ -1452,12 +1565,14 @@ function openApplyReportDialog(applied) {
 }
 // v1.2.1：最近一次恢复的改动清单（存 sessionStorage，刷新后仍可回看；关标签页即清空）
 const LAST_REPORT_KEY = "wsync.lastReport";
-function saveLastReport(applied) {
+function saveLastReport(applied, skipped) {
   try {
     sessionStorage.setItem(LAST_REPORT_KEY, JSON.stringify({
       n: applied.length,
+      // v1.2.6（第四轮盲审 T4）：把「没恢复的项数」一并存下来，回看时数字才对得上。
+      // 原 sourceWorld 字段存的是**当前世界**标题（命名反了）且全文件无人读取，已删（T5）。
+      skipped: skipped || 0,
       at: new Date().toISOString(),
-      sourceWorld: String(game.world?.title ?? ""),
       items: applied.slice(0, 200).map(c => ({ k: c.key, from: shortVal(c.from), to: shortVal(c.to), tag: describeChange(c.from, c.to) }))
     }));
   } catch (e) { /* 隐私模式或配额不足：忽略，不影响恢复本身 */ }
@@ -1474,9 +1589,11 @@ function openLastReportDialog() {
   const items = rep.items || [];
   const lines = items.map(it => `<div class="wsync-diff-row"><code>${escapeHtml(it.k)}</code><span class="wsync-diff-tag">${escapeHtml(it.tag || "")}</span><div class="wsync-diff-vals"><span class="wsync-v-now">${escapeHtml(it.from ?? "")}</span><span class="wsync-v-master">→</span><span class="wsync-v-now">${escapeHtml(it.to ?? "")}</span></div></div>`).join("");
   const trimmed = rep.n > items.length ? `<div class="wsync-diff-more">…还有 ${rep.n - items.length} 项（这里只回看最近 200 项）</div>` : "";
+  // v1.2.6（第四轮盲审 T4）：回看清单里也要有「另有 N 项没恢复」，否则事后再看就觉得全恢复了。
+  const skippedNote = rep.skipped ? `<div class="wsync-diff-more">另有 <b>${rep.skipped}</b> 项没有恢复：本世界没有安装对应的模组。</div>` : "";
   new Dialog({
     title: "上一次恢复改动了什么",
-    content: `<div class="wsync-body"><div class="wsync-diff-summary">共改动 <b>${rep.n}</b> 项 · 记录时间 ${escapeHtml(formatTs(rep.at))}<br>这份清单存在本浏览器会话里，刷新页面后仍可回看；关闭标签页后清空。</div>${lines}${trimmed}</div>`,
+    content: `<div class="wsync-body"><div class="wsync-diff-summary">共改动 <b>${rep.n}</b> 项 · 记录时间 ${escapeHtml(formatTs(rep.at))}<br>这份清单存在本浏览器会话里，刷新页面后仍可回看；关闭标签页后清空。</div>${skippedNote}${lines}${trimmed}</div>`,
     buttons: { close: { icon: "<i class=\"fa-solid fa-xmark\"></i>", label: "关闭", callback: () => {} } },
     render: ($h) => styleWindow($h)
   }, { classes: ["dialog", "wsync-app"], width: 640 }).render(true);
@@ -1748,7 +1865,13 @@ async function openSnapImportDialog(snap) {
 function restoreFromSnap(snap) {
   const { sel } = buildSelection(snap, readScopePref());
   const diff = diffSnapshot(snap, sel);
-  if (!diff.changed.length) { notify.ok("当前世界与这份快照一致，无需恢复。"); return; }
+  if (!diff.changed.length) {
+    // v1.2.6（第四轮盲审 G2）：与面板路径同一区分 —— 别把「缺模组没恢复」讲成「一致」。
+    const un = collectUnavailable(snap, sel);
+    if (un.length) notify.warn(describeUnavailable(un));
+    else notify.ok("当前世界与这份快照一致，无需恢复。");
+    return;
+  }
   // v1.2.3：先把 __sel/__snap 挂上再开弹窗 —— 弹窗里的按钮回调要靠这两个字段，
   // 顺序反了就是「弹窗先拿到一个还没装配好的清单」（autoPromptCheck 一直是正确顺序）。
   diff.changed.__sel = sel;
@@ -1786,7 +1909,15 @@ async function openRestoreConfirm($body) {
       return;
     }
     const diff = diffSnapshot(snap, sel);
-    if (!diff.changed.length) { notify.ok("当前世界与主世界基准一致，无需恢复。"); return; }
+    if (!diff.changed.length) {
+      // v1.2.6（第四轮盲审 G2）：「没有差异」有两种含义，必须分开说 ——
+      // ① 真的完全一致；② 能恢复的那部分已经一致，另有 N 项因为本机没装模组从未落地。
+      // 旧写法一律说「一致」，跨服务器搬家的用户永远看不到那 N 项（第四轮盲审目标场景）。
+      const un = collectUnavailable(snap, sel);
+      if (un.length) notify.warn(describeUnavailable(un));
+      else notify.ok("当前世界与主世界基准一致，无需恢复。");
+      return;
+    }
     // v1.2.3：先挂 __sel/__snap 再开弹窗（与 restoreFromSnap / autoPromptCheck 统一顺序）
     diff.changed.__sel = sel;
     diff.changed.__snap = snap;
@@ -1810,6 +1941,11 @@ async function openSyncPanel() {
   const snapNs = new Set();
   try {
     const text = await storageRead(MASTER_FILE);
+    // v1.2.6（第四轮盲审 G4）：先把缓存清掉再尝试解析。
+    // v1.2.5 把首次刷新改成 refreshStatus(false) 复用缓存之后，解析失败（快照损坏 /
+    // schema 不符 / 条目超限）会让 statusSnapCache 保留**上一次打开面板时的**快照，
+    // 而 refreshStatus 见缓存非空就跳过重读 → 状态栏拿旧基准算差异，还显示得好好的。
+    statusSnapCache = null;
     if (text) {
       const snap = parseSnapshot(text);
       for (const item of snap.settings) snapNs.add(String(item.key).split(".")[0]);
@@ -1817,10 +1953,9 @@ async function openSyncPanel() {
       // refreshStatus 又读一次：两次 HTTP 之间若主快照被别的 GM 更新，
       // 「模块勾选列表」与「状态栏差异数」就来自两份不同的快照。
       statusSnapCache = snap;
-    } else {
-      statusSnapCache = null;
     }
   } catch (e) {
+    statusSnapCache = null;
     console.warn("lh-world-sync: 主快照读取失败，恢复范围列表只列当前世界的模块", e);
   }
   const pref = readScopePref();
@@ -1986,9 +2121,16 @@ async function openSyncPanel() {
       const repHTML = rep
         ? `<div class="wsync-last-report">上一次恢复改动了 <b>${rep.n}</b> 项 · <span class="wsync-link" data-act="last-report">查看清单</span></div>`
         : "";
+      // v1.2.6（第四轮盲审 G1/G2）：状态栏也要说清「有 N 项因为本机没装模组而没参与比较」，
+      // 口径与三个早退、写入后的通知完全一致（同一个 collectUnavailable）。
+      const un = collectUnavailable(snap, sel);
+      const unMods = unavailableMods(un);
+      const unHTML = un.length
+        ? `<br><span class="wsync-status-none">另有 ${un.length} 项未参与比较：本世界没有安装对应的模组（${escapeHtml(unMods.slice(0, 5).join("、"))}${unMods.length > 5 ? " 等 " + unMods.length + " 个模组" : ""}）。</span>`
+        : "";
       $s.html((diff.changed.length
         ? `当前世界与主世界基准存在 <b class="wsync-diff-has">${diff.changed.length}</b> 处差异（${scopeNote}）。<br>${base}`
-        : `当前世界与主世界基准一致（${scopeNote}）。<br>${base}`) + repHTML);
+        : `当前世界与主世界基准一致（${scopeNote}）。<br>${base}`) + unHTML + repHTML);
       const $ap = $h.find("#wsync-autoprompt");
       if ($ap.length) $ap.prop("checked", game.settings.get(MODULE_ID, "autoPrompt"));
     } catch (e) {
@@ -2022,7 +2164,13 @@ async function autoPromptCheck() {
   // → 状态栏一直报差异、自动恢复却永不处理那些 core.* 键（审阅第 5 条）。
   const { sel } = buildSelection(snap, readScopePref());
   const diff = diffSnapshot(snap, sel);
-  if (!diff.changed.length) return;
+  if (!diff.changed.length) {
+    // v1.2.6（第四轮盲审 G2）：不弹窗 ≠ 没有差异 —— 差异也可能全是本机没装的模组。
+    // 那种情况至少要留一句可见的提示，否则用户会以为一切正常。
+    const un = collectUnavailable(snap, sel);
+    if (un.length) notify.warn(describeUnavailable(un));
+    return;
+  }
   diff.changed.__sel = sel;
   diff.changed.__snap = snap;
   const s = summaryText(diff.changed);

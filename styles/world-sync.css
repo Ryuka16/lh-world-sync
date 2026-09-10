@@ -1,5 +1,5 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.2.5 — 样式
+ * 世界同步装置 (lh-world-sync) v1.2.6 — 样式
  * 铁律参照：课程 CSS面板配置篇 / 教学视频库优化篇
  *   - 变量挂 .wsync-app[data-theme] 与 .wsync-themed（双保险）
  *   - .dialog-buttons 必须一并覆盖（窗口整体染色时底部标准按钮黑字黑底坑）
@@ -276,6 +276,9 @@
 .wsync-file-msg { font-size: 12px; min-height: 18px; }
 .wsync-file-ok { color: var(--wsync-ok); }
 .wsync-file-err { color: var(--wsync-bad); }
+/* v1.2.6：本机未安装这个模组 —— 它的设置不会被恢复，标灰并说明原因，别让用户白勾 */
+.wsync-ns-row.wsync-ns-off { opacity: 0.5; }
+.wsync-ns-row.wsync-ns-off .wsync-ns-count { color: var(--wsync-bad); }
 .wsync-paste {
   width: 100%;
   min-height: 140px;
