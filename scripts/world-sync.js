@@ -1,5 +1,38 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.3.3
+ * 世界同步装置 (lh-world-sync) v1.3.4
+ * ----------------------------------------------------------------------------
+ * v1.3.4：把「合集包文件夹结构」纳入同步 —— 修一个用户在真机上撞到的结构性缺陷。
+ *   【症状】把整理好文件夹的世界同步到一个新世界后，合集包**全部散在文件夹外**，
+ *   而包本身都在、能正常打开，只是没归位，界面上没有任何报错。
+ *   【根因】同一条事实存了两半，本模块只搬了一半：
+ *     ① 「哪个包在哪个文件夹里」= core.compendiumConfiguration（**Setting**）——
+ *        它在 :488 的 EXCLUDE_DEFAULT 之外，:1936 也自述「只有 core.moduleConfiguration
+ *        走独立开关，其余 core.* 与别的模块同等对待」⇒ 每次都被存进快照、每次都被恢复；
+ *     ② 文件夹本体是 **Folder 文档**（game.folders 里 type === "Compendium" 的那些），
+ *        本模块此前全文一个字都没碰过。
+ *   于是目标世界拿到一串 folder _id，去 game.folders 里查 —— 查不到就静默返回 null
+ *   （client/documents/collections/compendium-collection.mjs:161-163
+ *     get folder() { return game.folders.get(this.config.folder) ?? null; }
+ *    且该字段官方就允许 null，见同文件 :95-96 的 StringField({nullable:true})）
+ *   ⇒ 包被当成「没有文件夹」，安静地散到顶层。
+ *   【修法】快照新增可选字段 compendiumFolders（只带 _id/name/folder/sort/sorting/color，
+ *   不带 _stats/flags 这类跨世界脏数据）→ 恢复时先建缺失的夹子（keepId:true，两步法：
+ *   先全部建为顶层、再一次性补父子关系。用户自己那个「套用合集包布局」宏用的就是这套，
+ *   官方 CompendiumCollection.importAll() 也是这个路数）→ 动作记进账本 → 回档可撤销。
+ *   【安全边界】① 冲突一律按 _id 判断：目标世界已有的同 id 夹子完全不动，
+ *   只在「快照里有、当前没有」时新建 —— 宁可多出一个同名夹子，也不去动用户整理过的结构；
+ *   ② 回档只删「本次建的 + 现在没有任何包引用它 + 里面没有子夹」的夹子，
+ *   读不到合集包配置时一个都不删（fail closed：那份结构没有第二个副本）；
+ *   ③ 文件夹同步失败**不回滚设置** —— 设置那一步已经成功写完，回滚等于白丢一次同步，
+ *   而包本来就散在外面、不会更坏；如实报告「设置已恢复、文件夹未同步」，可重试。
+ *   【兼容】老快照没有这个字段 → 跳过、不报错、不删任何东西；
+ *   老版本模块读新快照 → 忽略该字段。schema 保持 1，不升版本号。
+ *   【附带修掉】validateApplyLogEntry 原来把「prev 为空」一律判为不合法 ——
+ *   一次「设置全同、只同步了文件夹」的恢复会写出空 prev 的账本，读取侧于是把整个条目丢掉，
+ *   唯一的撤销点静默消失。现在 folders 段有内容即算有效。
+ *   【另一处连带的假话】proceedApplySnap 原来只看 res.applied.length，
+ *   doRollback 原来只看 res.changedCount —— 两者在「只有文件夹变化」时都会把
+ *   「真的做了事」讲成「无需恢复 / 没有可回档的内容」，两处都已按新语义补齐判断。
  * ----------------------------------------------------------------------------
  * v1.3.3：外部审阅（对 v1.3.1 的复审）报出 4 条，逐条到代码里核实后**全部属实**，
  *   一次修完。四条的共同病根是同一句话：**同一件事存在多套语义**。
@@ -401,7 +434,7 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.3.3";
+const MODULE_VERSION = "1.3.4";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
@@ -984,6 +1017,42 @@ function getSettingDoc(key) {
 }
 
 /* ---------- 快照组装 ---------- */
+// v1.3.4：合集包文件夹结构（Folder 文档 —— game.folders 里 type === "Compendium" 的那些）。
+// 为什么必须由本模块来搬：文件夹本体是 **Folder 文档**，而「哪个包在哪个文件夹里」是
+// core.compendiumConfiguration 这个 **Setting**（client/game.mjs:173 的 getter 读的就是它）。
+// 两者是同一条事实的两半，本模块此前只搬 Setting（见 :488 EXCLUDE_DEFAULT 与
+// :1936 的注释「只有 core.moduleConfiguration 走独立开关，其余 core.* 与别的模块同等对待」
+// ⇒ compendiumConfiguration 每次都被存进快照、每次都被恢复）——
+// 于是配置过去了、夹子没过去：目标世界拿着一个查不到的 _id 去找夹子
+// （client/documents/collections/compendium-collection.mjs:161-163
+//   get folder() { return game.folders.get(this.config.folder) ?? null; }
+//  而且该字段官方就允许 null，见同文件 :95-96 的 StringField({nullable:true})）
+// ⇒ 包被静默当成「没有文件夹」，全部散到顶层，一句报错都没有。
+// 只取重建结构必需的字段：_id/name/folder/sort/sorting/color。
+// 不带 _stats（含 modifiedTime/systemId/coreVersion，搬到别的世界就是脏数据），
+// 也不带 flags（可能含别的模块的内部状态）。
+function collectCompendiumFolders() {
+  try {
+    return game.folders
+      .filter(f => f.type === "Compendium")
+      .map(f => ({
+        _id: f.id,
+        name: f.name,
+        // 父级取 _source.folder（就是 _id 字符串），与官方 getSubfolders() 的读法一致
+        //（client/documents/folder.mjs:366：game.folders.filter(f => f._source.folder === this.id)）。
+        // folder 字段本身是 ForeignDocumentField，序列化后是 id 字符串，null 表示顶层。
+        folder: f._source?.folder ?? null,
+        sort: Number.isFinite(f.sort) ? f.sort : 0,
+        sorting: f.sorting === "m" ? "m" : "a",
+        color: f.color ?? null
+      }));
+  } catch (e) {
+    // 读不到就如实返回 null，不要返回 [] —— 空数组的含义是「这个世界一个夹子都没有」，
+    // 与「这次没读到」是两件事。恢复侧据此跳过并说明，而不是把包从夹子里赶出来。
+    console.warn("[lh-world-sync] 合集包文件夹读取失败，本次快照不含文件夹结构：" + (e?.message || e));
+    return null;
+  }
+}
 function buildSnapshot() {
   const all = collectWorldSettings();
   const settings = [...all.entries()].map(([key, { value }]) => ({ key, value }));
@@ -1002,7 +1071,11 @@ function buildSnapshot() {
     systemVersion: game.system?.version ?? "",
     coreVersion: game.version ?? "",
     modules: modVersions,
-    settings
+    settings,
+    // v1.3.4：合集包文件夹结构。这是**可选**字段：
+    // 老版本模块读到它会忽略（parseSnapshot 只认自己认识的键），
+    // 本模块读到老快照（没有这个字段）时按「本次不同步文件夹」处理，不报错、不删任何东西。
+    compendiumFolders: collectCompendiumFolders()
   };
 }
 // 快照校验（v1.1.0 增强，审阅第 7 条）：
@@ -1060,6 +1133,32 @@ function parseSnapshot(text) {
   }
   if (snap.modules != null && (typeof snap.modules !== "object" || Array.isArray(snap.modules))) {
     throw new Error("快照的 modules 字段结构非法");
+  }
+  // v1.3.4：合集包文件夹段的校验。它是可选字段（老快照没有），
+  // 但一旦存在就必须结构可信 —— 恢复时我们会拿里面的 _id 去创建真实文档、
+  // 改真实的父子关系，这里少一道校验，脏数据就会一路走到写入阶段。
+  if (snap.compendiumFolders != null) {
+    if (!Array.isArray(snap.compendiumFolders)) {
+      throw new Error("快照的合集包文件夹段不是数组");
+    }
+    if (snap.compendiumFolders.length > 2000) {
+      throw new Error("快照里的合集包文件夹过多（" + snap.compendiumFolders.length
+        + " 个，上限 2000），疑似文件损坏，已拒绝导入");
+    }
+    const fseen = new Set();
+    for (const f of snap.compendiumFolders) {
+      if (!f || typeof f !== "object" || Array.isArray(f)) throw new Error("文件夹清单里存在非法条目");
+      if (typeof f._id !== "string" || !f._id) throw new Error("文件夹清单里存在没有 _id 的条目");
+      if (typeof f.name !== "string" || !f.name) throw new Error("文件夹「" + f._id + "」没有名字");
+      if (f.folder != null && typeof f.folder !== "string") {
+        throw new Error("文件夹「" + f._id + "」的父级不是字符串");
+      }
+      // 官方在 common/documents/folder.mjs:53-57 的 validateJoint 里禁止自包含，
+      // 这里提前拦掉，免得把一条必然失败的写入带进恢复流程。
+      if (f.folder === f._id) throw new Error("文件夹「" + f._id + "」把自己当成了父级");
+      if (fseen.has(f._id)) throw new Error("文件夹清单里有重复的 _id：" + f._id);
+      fseen.add(f._id);
+    }
   }
   return snap;
 }
@@ -1181,7 +1280,15 @@ function validateApplyLogEntry(entry) {
   const prev = entry.prev;
   if (!prev || typeof prev !== "object" || Array.isArray(prev)) return "prev 不是对象";
   const keys = Object.keys(prev);
-  if (keys.length === 0) return "prev 里一条记录都没有";
+  // v1.3.4：prev 为空不再一律判无效。一次「设置全同、只同步了合集包文件夹」的恢复
+  // 会写出一份空 prev 的账本；原先这里判它「一条记录都没有」= 不合法，
+  // 读取侧于是把整个条目丢掉 —— 唯一的撤销点就此静默消失（回档会说「没有可回档记录」）。
+  // 现在：只有 prev 与 folders 两边都没有内容时，才算真的没有东西可撤销。
+  const fl = entry.folders;
+  const hasFolderWork = !!fl && typeof fl === "object" && !Array.isArray(fl)
+    && ((Array.isArray(fl.created) && fl.created.length > 0)
+     || (Array.isArray(fl.reparented) && fl.reparented.length > 0));
+  if (keys.length === 0 && !hasFolderWork) return "prev 里一条记录都没有";
   if (keys.length > 20000) return "条目过多（" + keys.length + " 项，上限 20000）";
   for (const k of keys) {
     if (typeof k !== "string" || !k.includes(".")) return "键名不合法：" + String(k);
@@ -1294,7 +1401,7 @@ async function readApplyLogStore() {
 function hasStableWorldId() {
   return !!(game.world?.id ?? game.world?._id);
 }
-async function writeApplyLog(prevMap, afterMap) {
+async function writeApplyLog(prevMap, afterMap, folderPlan) {
   if (!hasStableWorldId()) {
     throw new Error("当前世界没有稳定标识（game.world.id 取不到），无法安全地写回档账本 —— 本次操作已中止，世界未做任何改动。");
   }
@@ -1345,7 +1452,15 @@ async function writeApplyLog(prevMap, afterMap) {
     opId: opId,
     rolledBackAt: null,
     after: afterMap ? Object.fromEntries([...afterMap.entries()]) : {},
-    prev: Object.fromEntries([...prevMap.entries()].map(([k, v]) => [k, { present: v.present, value: v.value }]))
+    prev: Object.fromEntries([...prevMap.entries()].map(([k, v]) => [k, { present: v.present, value: v.value }])),
+    // v1.3.4：本次恢复对「合集包文件夹」做的事 —— 回档据此撤销。
+    //   created    = 本次新建的夹子 id（回档时删，前提是没人再引用它）
+    //   reparented = 本次改过父级的夹子及改动前后的值（回档时还原，前提是用户没再动过）
+    // null / 缺失 = 本次没有文件夹动作。老账本没有这个字段，读取侧一律容忍。
+    folders: (folderPlan && folderPlan.active && folderPlan.total) ? {
+      created: folderPlan.toCreate.map(f => f._id),
+      reparented: folderPlan.toReparent.map(r => ({ _id: r._id, before: r.before, after: r.after }))
+    } : null
   };
   await storageWrite(applyLogFile(), JSON.stringify(store, null, 2));
   return opId;   // v1.2.8：交给 applySnapshot，写完设置后用同一个 opId 标「已完成」
@@ -1504,6 +1619,90 @@ function describeUnavailable(keys) {
     + "）—— 多数是你以前装过、后来卸载的模组。卸载只删程序不删设置，那些设置一直留在世界里。"
     + "哪天把模组装回来，再恢复即可。";
 }
+/* ---------- 合集包文件夹：先算清，再动手（v1.3.4） ---------- */
+// 与 applySnapshot 内部的既有模式一致（见它「先算出真正会写什么，再记账、再写」的注释）：
+// 任何写入之前先把完整计划算出来，计划同时供「写账本 / 执行 / 报告」三处使用，绝不边算边写。
+// 冲突语义（用户拍板）：一律按 _id 判断。目标世界已有的同 id 夹子完全不动，
+// 只在「快照里有、当前没有」时新建 —— 宁可多出一个同名夹子，
+// 也不去合并 / 改名 / 搬动用户自己整理过的夹子。
+function planCompendiumFolders(snap, sel) {
+  if (sel?.includeCompendiumFolders === false) {
+    return { active: false, reason: "not-selected", toCreate: [], toReparent: [], links: [], total: 0 };
+  }
+  const list = Array.isArray(snap?.compendiumFolders) ? snap.compendiumFolders : null;
+  if (!list) {
+    // 老快照没有这一段：不报错、不删任何东西，只是本次不同步文件夹结构。
+    return { active: false, reason: "old-snapshot", toCreate: [], toReparent: [], links: [], total: 0 };
+  }
+  const existing = new Set(game.folders.filter(f => f.type === "Compendium").map(f => f.id));
+  const toCreate = list.filter(f => !existing.has(f._id)).map(f => ({
+    _id: f._id,
+    name: f.name,
+    type: "Compendium",
+    // 一律先建为顶层：它的父夹可能也在这一批里、此刻还没建出来。
+    // 父子关系统一放到创建之后一次性补 —— 与用户自己那个「套用合集包布局」宏
+    // 是同一套两步法，官方的 CompendiumCollection.importAll() 也是这个路数
+    //（client/documents/collections/compendium-collection.mjs:570-577：先把夹子建出来，
+    //  再给没有父级的补 parentFolder.id）。
+    folder: null,
+    sort: Number.isFinite(f.sort) ? f.sort : 0,
+    sorting: f.sorting === "m" ? "m" : "a",
+    color: f.color ?? null
+  }));
+  // 父子关系：只对「当前父级 ≠ 快照父级」的动手，并记下改动前的值（回档要还原）。
+  // 本次新建的不记 —— 回档把它们整体删掉即可，不需要单独还原父级。
+  const toReparent = [];
+  for (const f of list) {
+    if (!f.folder) continue;
+    if (!existing.has(f._id)) continue;        // 本次新建的，跳过
+    const cur = game.folders.get(f._id);
+    if (!cur) continue;
+    const before = cur._source?.folder ?? null;
+    if (before === f.folder) continue;         // 已经对了，不动它
+    toReparent.push({ _id: f._id, before, after: f.folder });
+  }
+  return {
+    active: true,
+    reason: "ok",
+    toCreate,
+    toReparent,
+    // 补父子关系用「全量清单」（含刚新建的那批），与用户宏里的 links 一致。
+    // 正因为它是全量，多层嵌套一次就位，不需要按深度分轮。
+    links: list.filter(f => f.folder).map(f => ({ _id: f._id, folder: f.folder })),
+    total: toCreate.length + toReparent.length
+  };
+}
+// 执行文件夹计划。
+// 失败策略（按「会失去什么」定，见 v1.3.3 那条铁律）：这里抛错时**不回滚设置** ——
+// 设置那一步已经成功写完了，回滚它等于白丢一次同步；而文件夹没建成只是维持原状，
+// 不会比同步前更坏（包本来就已经散在外面了）。上层据此如实报告
+// 「设置已恢复，文件夹结构未同步」，用户修好原因后可以再恢复一次。
+async function applyCompendiumFolders(plan) {
+  const done = { created: [], reparented: [] };
+  if (!plan?.active || !plan.total) return done;
+  const FolderCls = foundry.utils.getDocumentClass("Folder");
+  if (plan.toCreate.length) {
+    // keepId:true 是这里的关键 —— 不传它就等于放弃 _id
+    //（common/abstract/document.mjs:454-460：`if ( !keepId ) delete data._id;`），
+    // 而 compendiumConfiguration 里记的正是这些 _id，换了 id 就等于白建。
+    // 官方两种「往外搬」的路径都用它：Adventure 导入（client/documents/adventure.mjs:151-157
+    //  `{ keepId: true, render: false, renderSheet: false }`，注释写着 Keep adventure document IDs）
+    // 与 CompendiumCollection.importAll()（compendium-collection.mjs:577）。
+    const made = await FolderCls.createDocuments(plan.toCreate, { keepId: true, render: false });
+    for (const d of (made ?? [])) { const id = d?._id ?? d?.id; if (id) done.created.push(id); }
+    // 数量对不上要说出来（keepId 被拒 / 部分失败都可能），不能默不作声地少建几个夹子 ——
+    // 那会让报告的「已同步 N 个文件夹」变成虚报。
+    if (done.created.length !== plan.toCreate.length) {
+      console.warn("[lh-world-sync] 合集包文件夹创建数不符：计划 " + plan.toCreate.length
+        + " 个，实际 " + done.created.length + " 个");
+    }
+  }
+  if (plan.links?.length) {
+    await FolderCls.updateDocuments(plan.links, { render: false });
+    done.reparented = plan.toReparent.map(r => ({ ...r }));
+  }
+  return done;
+}
 async function applySnapshot(snap, selection, precomputed) {
   // 写入口守卫（审阅第 10 条）：window.lhWorldSync.applySnapshot 对所有人生效
   if (!assertGM()) return { applied: [], skipped: 0, denied: true };
@@ -1517,7 +1716,13 @@ async function applySnapshot(snap, selection, precomputed) {
   // v1.2.1：允许调用方把弹窗里已经算好的清单原样传进来（自查第 8 项），
   // 让「用户看到的清单」与「实际写入的清单」是同一份，而不是各算一次。
   const diff = Array.isArray(precomputed) ? { changed: precomputed } : diffSnapshot(snap, selection);
-  if (!diff.changed.length) return { applied: [], skipped: unavailable.length };
+  // v1.3.4：合集包文件夹可能与设置**无关地**存在差异（设置全同、只有夹子变了），
+  // 所以「没有设置差异」不再等于「什么都不用做」。计划是纯计算、不改任何状态，
+  // 放在这里算好，既用于这个提前返回的判断，也用于后面的账本与执行。
+  const folderPlan = planCompendiumFolders(snap, selection);
+  if (!diff.changed.length && !folderPlan.total) {
+    return { applied: [], skipped: unavailable.length, folders: null, folderPlan };
+  }
   // v1.2.9（B4）：互斥（会话闸 + 文件锁）改走唯一入口 withOpLock。
   // v1.2.5~v1.2.8 这里是第二套手写实现：自己的 beginOp、自己的 acquireLock、
   // 自己的拒绝文案、自己的 try/finally —— 与 withOpLock、与回档路径各写一遍。
@@ -1574,7 +1779,7 @@ async function applySnapshot(snap, selection, precomputed) {
     // 写账本（任何写入之前；失败=直接报错，未动任何设置）
     let logOpId = null;
     try {
-      logOpId = await writeApplyLog(prevMap, afterMap);
+      logOpId = await writeApplyLog(prevMap, afterMap, folderPlan);
     } catch (e0) {
       // v1.2.3：账本都没写成 = 一个设置都没动过。
       // 打上标记，别让外层把它说成「已自动回滚到恢复前的状态」——那是假话。
@@ -1629,6 +1834,21 @@ async function applySnapshot(snap, selection, precomputed) {
       e.__rollbackFailed = !!rollbackErr;
       throw e;
     }
+    // v1.3.4：设置写完 → 同步「合集包文件夹」结构。
+    // 顺序不能反：配置（compendiumConfiguration）必须先落进世界，
+    // 否则夹子建好了也还没有包指向它们；而夹子只要真实存在，配置一恢复就自动归位
+    //（compendium-collection.mjs:161-163 的 get folder() 立刻就能查到）。
+    let folderResult = null;
+    let folderError = null;
+    if (folderPlan.active && folderPlan.total) {
+      try {
+        folderResult = await applyCompendiumFolders(folderPlan);
+      } catch (e) {
+        // 不回滚设置（理由见 applyCompendiumFolders 的注释）。如实带上去，让报告说清楚。
+        folderError = e?.message || String(e);
+        console.error("[lh-world-sync] 合集包文件夹同步失败（设置已恢复，文件夹未同步，未回滚设置）：", e);
+      }
+    }
     // v1.2.8（B7）：设置真的写完了 → 账本从 pending 改成 applied。
     // 这一步失败不影响恢复结果（设置已经写进去），只影响「下次回档时怎么解释」，
     // 所以只留日志、不抛错。
@@ -1640,7 +1860,10 @@ async function applySnapshot(snap, selection, precomputed) {
         + unavailableMods(unavailable).join("、"));
       notify.warn(describeUnavailable(unavailable));
     }
-    return { applied: plan, skipped: unavailable.length, skippedKeys: unavailable };
+    return { applied: plan, skipped: unavailable.length, skippedKeys: unavailable,
+      folders: folderResult, folderError: folderError,
+      folderPlanActive: folderPlan.active, folderPlanReason: folderPlan.reason,
+      folderPlanned: folderPlan.total };
   }, "恢复主世界");
   // v1.2.9（B4）：把 withOpLock 的 busy/locked 补成上层认识的样子 ——
   // 上层 proceedApplySnap 会读 res.applied.length，形状不齐会变成 TypeError。
@@ -1769,7 +1992,59 @@ async function rollbackApplyLog() {
       e.__rollbackFailed = !!rollbackErr;
       throw e;
     }
-    // ④ 成功 → 就地标记账本已消费（审阅第 8 条：原实现可无限重复回档）
+    // ④ v1.3.4：撤销本次恢复对「合集包文件夹」做的事。
+    // 顺序有意义：上面已经把 core.compendiumConfiguration 还原成回档前的值，
+    // 所以这里读到的是「回档之后」的引用关系 —— 判断某个夹子还有没有人要，用的就是它。
+    // 只删「本次建的 + 现在没有任何包引用它 + 里面没有子夹」的；任何一条不满足就保留并报出来。
+    // 读不到配置时一个都不删（fail closed：宁可留下一个空夹子，也不能把用户
+    // 自己整理过的结构删掉 —— 那份结构没有第二个副本）。
+    const folderUndo = { deleted: [], reparented: [], kept: [], error: null };
+    const flog = (log.folders && typeof log.folders === "object" && !Array.isArray(log.folders)) ? log.folders : null;
+    if (flog) {
+      const FolderCls = foundry.utils.getDocumentClass("Folder");
+      let referenced = null;
+      try {
+        const cfg = game.settings.get("core", "compendiumConfiguration") ?? {};
+        referenced = new Set(Object.values(cfg).map(c => c?.folder).filter(Boolean));
+      } catch (e) { referenced = null; }
+      const toDelete = [];
+      for (const id of (Array.isArray(flog.created) ? flog.created : [])) {
+        const f = game.folders.get(id);
+        if (!f || f.type !== "Compendium") { folderUndo.kept.push({ id, name: String(id), why: "已经不存在了" }); continue; }
+        if (!referenced) { folderUndo.kept.push({ id, name: f.name, why: "读不到合集包配置，无法确认没有包还在用它" }); continue; }
+        if (referenced.has(id)) { folderUndo.kept.push({ id, name: f.name, why: "现在还有合集包归在这个夹子里" }); continue; }
+        if (f.getSubfolders(false).length) { folderUndo.kept.push({ id, name: f.name, why: "里面还有子文件夹" }); continue; }
+        toDelete.push(id);
+      }
+      const relink = [];
+      for (const r of (Array.isArray(flog.reparented) ? flog.reparented : [])) {
+        const f = game.folders.get(r?._id);
+        if (!f) continue;
+        const now = f._source?.folder ?? null;
+        // 回档之后用户自己又挪过它 —— 那是他的成果，保留不动
+        //（与 v1.3.1 修 S4「别把用户后来重新配置的值一起删掉」同一条判据）。
+        if (now !== (r.after ?? null)) {
+          folderUndo.kept.push({ id: r._id, name: f.name, why: "回档前你已经把它移到别处了" });
+          continue;
+        }
+        relink.push({ _id: r._id, folder: r.before ?? null });
+      }
+      try {
+        if (toDelete.length) {
+          await FolderCls.deleteDocuments(toDelete, { render: false });
+          folderUndo.deleted = toDelete.slice();
+        }
+        if (relink.length) {
+          await FolderCls.updateDocuments(relink, { render: false });
+          folderUndo.reparented = relink.map(r => r._id);
+        }
+      } catch (e) {
+        // 文件夹没还原干净 ≠ 设置没还原。如实带上去，让它出现在回档报告里。
+        console.error("[lh-world-sync] 合集包文件夹还原失败（设置已还原，文件夹可能停在中间状态）", e);
+        folderUndo.error = e?.message || String(e);
+      }
+    }
+    // ⑤ 成功 → 就地标记账本已消费（审阅第 8 条：原实现可无限重复回档）
     try { await markLogRolledBack(); } catch (e) { console.error("lh-world-sync mark rolled-back failed", e); }
     // ⑤ 报告清单：按回档前的实际情况描述每一项究竟做了什么
     // v1.2.2：把「真的动过」和「本来就没这项、什么都没做」分成两笔账 ——
@@ -1789,7 +2064,7 @@ async function rollbackApplyLog() {
         restored.push({ key, action: "恢复", value: p.value });
       }
     }
-    return { log, restored, untouched, keptDrift, changedCount: restored.length, untouchedCount: untouched.length };
+    return { log, restored, untouched, keptDrift, changedCount: restored.length, untouchedCount: untouched.length, folderUndo };
   }, "回档");
   // v1.2.9（B4）：同上，补齐上层认识的形状
   if (r?.busy || r?.locked) return { busy: r.busy, locked: r.locked, staleSelf: r.staleSelf };
@@ -1854,6 +2129,8 @@ function panelContentHTML(snapNs, pref) {
   const mode = pref?.mode ?? "all";
   const allChecked = mode === "all";
   const modCfgChecked = mode === "all" ? true : pref?.includeModuleConfig !== false;
+  // v1.3.4：合集包文件夹结构 —— 与 modcfg 同一套默认语义（老偏好没有这个字段时按「开启」）
+  const compFoldersChecked = mode === "all" ? true : pref?.includeCompendiumFolders !== false;
   const scopeNow = mode === "all"
     ? "全部模块"
     : "自定义（" + Object.keys(pref?.ns ?? {}).filter(k => pref.ns[k]).length + " 个模块）";
@@ -1884,6 +2161,7 @@ function panelContentHTML(snapNs, pref) {
           <label class="wsync-ns-row"><input type="checkbox" id="wsync-ns-all" value="*"${allChecked ? " checked" : ""}><span class="wsync-ns-name"><b>全选</b></span><span class="wsync-ns-count">${count} 个模块</span></label>
           ${rows}
           <label class="wsync-ns-row wsync-ns-modcfg"><input type="checkbox" id="wsync-modcfg" value="modcfg"${modCfgChecked ? " checked" : ""}><span class="wsync-ns-name">模组启用状态<em class="wsync-ns-title">对应「设置 → 管理模组」中的开关</em></span><span class="wsync-ns-count">随快照恢复</span></label>
+          <label class="wsync-ns-row wsync-ns-modcfg"><input type="checkbox" id="wsync-compfolders" value="compfolders"${compFoldersChecked ? " checked" : ""}><span class="wsync-ns-name">合集包文件夹结构<em class="wsync-ns-title">把「哪个合集包放在哪个文件夹里」的夹子一起带过来</em></span><span class="wsync-ns-count">随快照恢复</span></label>
         </div>
         <div class="wsync-scope-hint" id="wsync-scope-hint">当前范围：<b>${scopeNow}</b>${extra ? " · 其中 " + extra + " 个模块本世界还没有它的设置（来自主快照）" : ""} · 改动后点「保存范围」，会存成这个世界的长期偏好——「恢复主世界」与进世界自动提醒都按它执行。</div>
         <label class="wsync-ns-row wsync-ns-autoprompt"><input type="checkbox" id="wsync-autoprompt"${game.settings.get(MODULE_ID, "autoPrompt") ? " checked" : ""}><span class="wsync-ns-name">进入世界时自动提醒<em class="wsync-ns-title">关闭后仅在手动点击「恢复主世界」时执行恢复</em></span></label>
@@ -1904,6 +2182,8 @@ function selectionFromPanel($h) {
   const sel = { ns: {}, includeModuleConfig: false };
   $h.find(".wsync-ns-row input[data-ns]:checked").each((i, el) => { sel.ns[el.dataset.ns] = true; });
   sel.includeModuleConfig = !!$h.find("#wsync-modcfg").is(":checked");
+  // v1.3.4：合集包文件夹结构（独立勾选，用户拍板 —— 不跟随 core 命名空间）
+  sel.includeCompendiumFolders = !!$h.find("#wsync-compfolders").is(":checked");
   return sel;
 }
 // 子项变化 → 反向维护「全选」的 checked / indeterminate（否则全选永远打勾）
@@ -1922,12 +2202,15 @@ function readScopePref() {
   let raw = null;
   try { raw = game.settings.get(MODULE_ID, SCOPE_SETTING); } catch (e) { raw = null; }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return { mode: "all", ns: {}, includeModuleConfig: true };
+    return { mode: "all", ns: {}, includeModuleConfig: true, includeCompendiumFolders: true };
   }
   return {
     mode: raw.mode === "custom" ? "custom" : "all",
     ns: (raw.ns && typeof raw.ns === "object" && !Array.isArray(raw.ns)) ? { ...raw.ns } : {},
-    includeModuleConfig: raw.includeModuleConfig !== false
+    includeModuleConfig: raw.includeModuleConfig !== false,
+    // v1.3.4：老偏好里没有这个字段 —— 按「开启」处理（`!== false`），
+    // 与 includeModuleConfig 同一套默认语义，不制造第三种含义。
+    includeCompendiumFolders: raw.includeCompendiumFolders !== false
   };
 }
 // 由「快照 + 偏好」生成 selection：手动恢复 / 进世界自动提醒 / 文件导入 /
@@ -1935,7 +2218,7 @@ function readScopePref() {
 // 整个 core，手动路径不排除 → 状态栏一直报差异而自动恢复永不处理）。
 // 现在只有 core.moduleConfiguration 走独立开关，其余 core.* 与别的模块同等对待。
 function buildSelection(snap, pref = readScopePref()) {
-  const sel = { ns: {}, includeModuleConfig: false };
+  const sel = { ns: {}, includeModuleConfig: false, includeCompendiumFolders: false };
   const snapNs = new Set();
   let hasModCfg = false;
   for (const item of (snap?.settings ?? [])) {
@@ -1955,6 +2238,11 @@ function buildSelection(snap, pref = readScopePref()) {
     for (const ns of picked) sel.ns[ns] = true;
   }
   sel.includeModuleConfig = hasModCfg && pref.includeModuleConfig !== false;
+  // v1.3.4：合集包文件夹结构走独立勾选（用户拍板），不跟随 core 命名空间。
+  // 它不属于任何命名空间，所以不参与上面 ns 的计算；
+  // 且只有快照确实带了这个字段时才有意义（老快照没有 = 无从同步，静默跳过）。
+  sel.includeCompendiumFolders = (pref.includeCompendiumFolders !== false)
+    && Array.isArray(snap?.compendiumFolders);
   return { sel, snapNs, hasModCfg };
 }
 // 把面板勾选存成偏好：全勾 + 带模块开关 → mode:"all"（这样以后新装的模块也跟随）
@@ -1964,14 +2252,19 @@ async function saveScopePref(sel, totalNs) {
   // 面板显示「自定义（0 个模块）」，而 buildSelection 把空范围当「全部」、
   // selectionFromPanel 又当「什么都不恢复」—— 同一份偏好三种含义、三条路径三种提示。
   // 现在从源头不让存（返回 null，提示在这里给），调用方拿到 null 直接收手。
-  if (picked === 0 && !sel.includeModuleConfig) {
-    notify.warn("没有勾选任何恢复范围，未保存。请至少勾选一个模块，或勾上「模组启用状态」。");
+  // v1.3.4：合集包文件夹结构也是一个能独立成立的范围 —— 只勾它、其余全不勾是合法的，
+  // 不能被这条「一个都没勾」的拦截误伤（它已经在面板上作为一个可选项存在了）。
+  if (picked === 0 && !sel.includeModuleConfig && !sel.includeCompendiumFolders) {
+    notify.warn("没有勾选任何恢复范围，未保存。请至少勾选一个模块，或勾上「模组启用状态」/「合集包文件夹结构」。");
     return null;
   }
-  const isAll = picked >= totalNs && sel.includeModuleConfig;
+  // v1.3.4：isAll 要连带文件夹那一项 —— 用户全勾了模块却特意取消文件夹，
+  // 那是「自定义」而不是「全部」（自定义才会把 includeCompendiumFolders:false 存进去）。
+  const isAll = picked >= totalNs && sel.includeModuleConfig && sel.includeCompendiumFolders;
   const pref = isAll
-    ? { mode: "all", ns: {}, includeModuleConfig: true }
-    : { mode: "custom", ns: { ...sel.ns }, includeModuleConfig: !!sel.includeModuleConfig };
+    ? { mode: "all", ns: {}, includeModuleConfig: true, includeCompendiumFolders: true }
+    : { mode: "custom", ns: { ...sel.ns }, includeModuleConfig: !!sel.includeModuleConfig,
+        includeCompendiumFolders: !!sel.includeCompendiumFolders };
   await game.settings.set(MODULE_ID, SCOPE_SETTING, pref);
   return pref;
 }
@@ -2029,7 +2322,11 @@ async function proceedApplySnap(changed) {
     // 这里不能再补一句「基准一致，无需恢复」——那是把「没执行」讲成「没必要」。
     // v1.2.5：同会话重入闸的 busy 也是「没执行」，必须一起挡掉（第三轮盲审发现漏了它）。
     if (res.locked || res.denied || res.busy) return;
-    if (!res.applied.length) {
+    // v1.3.4：合集包文件夹也是「这次真的做了事」的一种 —— 只同步了文件夹时
+    // 不能说「当前世界与主世界基准一致，无需恢复」（那是假话，夹子明明刚建出来）。
+    const folderTouched = !!(res.folders
+      && (((res.folders.created?.length) ?? 0) || ((res.folders.reparented?.length) ?? 0)));
+    if (!res.applied.length && !folderTouched) {
       // v1.2.5：区分「真的没有差异」与「有差异但全被跳过（本机没装那些模组）」——
       // 后者说成「基准一致」是假话，而且会让用户以为已经恢复过了。
       if (res.skipped) {
@@ -2041,7 +2338,7 @@ async function proceedApplySnap(changed) {
     }
     // 记录「刚才应用过」：刷新后跳过一轮自动提醒，避免弹窗自问自答
     try { sessionStorage.setItem("wsync.justApplied", Date.now()); } catch (e) {}
-    openApplyReportDialog(res.applied, res.skipped);
+    openApplyReportDialog(res.applied, res.skipped, res.folders, res.folderError);
   } catch (e) {
     console.error(e);
     // v1.2.2：回滚失败就不能说「已自动回滚」—— 如实告知世界可能停在中间状态，
@@ -2059,8 +2356,17 @@ async function proceedApplySnap(changed) {
           : "恢复失败，已自动回滚到恢复前的状态：" + (e?.message || e));
   }
 }
-function openApplyReportDialog(applied, skipped) {
+function openApplyReportDialog(applied, skipped, folders, folderError) {
   const hasModCfg = applied.some(c => c.key === "core.moduleConfiguration");
+  // v1.3.4：合集包文件夹的同步结果，报告里必须有一行 ——
+  // 报告是用户事后唯一能回看的凭据（第四轮盲审 T4 的教训），漏了就等于没做。
+  const nFoldCreated = folders?.created?.length ?? 0;
+  const nFoldReparent = folders?.reparented?.length ?? 0;
+  const folderNote = folderError
+    ? `<div class="wsync-diff-more"><b>合集包文件夹结构没有同步成功</b>（设置已恢复，不受影响）：${escapeHtml(folderError)}<br>修好原因后再点一次「恢复主世界」即可补上。</div>`
+    : ((nFoldCreated || nFoldReparent)
+      ? `<div class="wsync-diff-more">合集包文件夹结构已同步：新建 <b>${nFoldCreated}</b> 个文件夹${nFoldReparent ? "，调整 " + nFoldReparent + " 个文件夹的层级" : ""}。刷新后合集包会自动归位。</div>`
+      : "");
   // v1.2.6（第四轮盲审 T4）：原来「另有 N 项未恢复」只出现在一条瞬时通知里，
   // 不进报告、不进「上一次恢复改动了什么」—— 刷新之后这句话就消失了。
   // 报告是用户事后唯一能回看的凭据，缺这项就等于没说过。
@@ -2089,7 +2395,7 @@ function openApplyReportDialog(applied, skipped) {
   }, RELOAD_MS);
   new Dialog({
     title: `恢复完成 · ${RELOAD_MS / 1000} 秒后自动刷新`,
-    content: `<div class="wsync-body"><div class="wsync-diff-summary">已恢复 <b>${applied.length}</b> 项设置。${hasModCfg ? "<b>模组启用状态已一并恢复</b>（此前被关闭的模组将重新启用）。" : ""}<br>页面将在 ${RELOAD_MS / 1000} 秒后自动刷新并生效。刷新完成后，仍可在面板里查看这次改动的清单。如需撤销，刷新完成后点「回档」。</div>${skippedNote}${lines}${trimmed}</div>`,
+    content: `<div class="wsync-body"><div class="wsync-diff-summary">${applied.length ? `已恢复 <b>${applied.length}</b> 项设置。` : "设置本来就与基准一致，<b>本次没有改动任何设置</b>。"}${hasModCfg ? "<b>模组启用状态已一并恢复</b>（此前被关闭的模组将重新启用）。" : ""}<br>页面将在 ${RELOAD_MS / 1000} 秒后自动刷新并生效。刷新完成后，仍可在面板里查看这次改动的清单。如需撤销，刷新完成后点「回档」。</div>${skippedNote}${folderNote}${lines}${trimmed}</div>`,
     buttons: {
       now: { icon: "<i class=\"fa-solid fa-rotate\"></i>", label: "立即刷新", callback: () => { clearTimeout(timer); window.location.reload(); } },
       later: { icon: "<i class=\"fa-solid fa-clock\"></i>", label: "稍后再刷新", callback: () => { clearTimeout(timer); notify.ok("已取消自动刷新。模组启用状态要下次刷新页面才生效。"); } },
@@ -2223,12 +2529,28 @@ async function doRollback() {
     const skippedNote = res.untouchedCount
       ? `另有 ${res.untouchedCount} 项在本世界本来就不存在，未做任何操作。`
       : "";
-    const head = res.changedCount
-      ? `已回档 ${res.changedCount} 项：上次恢复所改动的设置已还原。${skippedNote}`
+    // v1.3.4：合集包文件夹也是「这次真的做了什么」的一种。
+    // 一次「设置全同、只同步了文件夹」的恢复，回档时 changedCount 是 0，
+    // 原来这里会说「上次恢复涉及的设置在本世界已经不存在，无需回档」——
+    // 而文件夹结构其实刚刚被还原了，那句话是假的。
+    const fu = res.folderUndo;
+    const nFoldDeleted = fu?.deleted?.length ?? 0;
+    const nFoldRelink = fu?.reparented?.length ?? 0;
+    const nFoldKept = fu?.kept?.length ?? 0;
+    const folderHead = (nFoldDeleted || nFoldRelink)
+      ? `，并还原了合集包文件夹结构（删除新建的 <b>${nFoldDeleted}</b> 个文件夹${nFoldRelink ? "、还原 " + nFoldRelink + " 个文件夹的层级" : ""}）`
+      : "";
+    const folderNote = fu?.error
+      ? `<div class="wsync-diff-more"><b>合集包文件夹结构没有还原成功</b>（设置已还原）：${escapeHtml(fu.error)}<br>请到侧边栏「合集包」里手动看一下这几个文件夹。</div>`
+      : (nFoldKept
+        ? `<div class="wsync-diff-more">有 <b>${nFoldKept}</b> 个文件夹<b>原样保留</b>，没有删：${escapeHtml(fu.kept.slice(0, 3).map(k => k.name + "（" + k.why + "）").join("；"))}${nFoldKept > 3 ? " 等" : ""}。</div>`
+        : "");
+    const head = (res.changedCount || nFoldDeleted || nFoldRelink)
+      ? `已回档 ${res.changedCount} 项设置${folderHead}。${skippedNote}`
       : `上次恢复涉及的设置在本世界已经不存在，无需回档。`;
     new Dialog({
       title: "回档完成 · 恢复了什么",
-      content: `<div class="wsync-body"><div class="wsync-diff-summary">${head}</div>${keptNote}${lines}${trimmed}</div>`,
+      content: `<div class="wsync-body"><div class="wsync-diff-summary">${head}</div>${keptNote}${folderNote}${lines}${trimmed}</div>`,
       buttons: { close: { icon: "<i class=\"fa-solid fa-xmark\"></i>", label: "关闭", callback: () => {} } },
       render: ($h) => styleWindow($h)
     }, { classes: ["dialog", "wsync-app"], width: 640 }).render(true);
