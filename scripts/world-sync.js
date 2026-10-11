@@ -1,5 +1,57 @@
 /* ============================================================================
- * 世界同步装置 (lh-world-sync) v1.3.4
+ * 世界同步装置 (lh-world-sync) v1.3.6
+ * ----------------------------------------------------------------------------
+ * v1.3.6：合集包文件夹「名字（汉化）/ 排序 / 颜色」也纳入同步——
+ *   修 v1.3.5 在真机上暴露的漏网（用户原话：
+ *   「有一些文件夹的汉化没有生效，保留到新世界去」—— 指的是合集包侧边栏里
+ *   「德拉肯海姆」「斯坦哈德」这几个他已在主世界改成中文、这边却仍是英文的夹子）。
+ *   【症状】主快照里明明是「德拉肯海姆」，目标世界显示的还是 "Drakkenheim"，
+ *   恢复多少次都不变。
+ *   【根因】planCompendiumFolders 判断一个夹子「要不要处理」时**只看 _id 存不存在** ——
+ *   id 相同就整条跳过，name 从头到尾没人比对过。真机实测两边的 _id 完全一样
+ *   （B6xiFXgi7APraqO3 在主快照里叫「德拉肯海姆」、在目标世界叫 "Drakkenheim"），
+ *   于是「同一个夹子、换了个标签」这类改动（汉化、改名、调排序、换颜色）永远同步不过去。
+ *   【修法】对「已存在」的夹子逐字段比对 name / folder / sort / sorting / color，
+ *   只把**真正不同**的写进 links（没变的一个字都不写，避免无谓的 update 事件惊动别的模块），
+ *   与补父子关系合并成同一次 updateDocuments。
+ *   【连带修掉】v1.3.5 就有的一处漏网：快照里是顶层、当前是子夹时，links 原来只收
+ *   f.folder 有值的项 ⇒ 这个夹子永远移不回顶层；可 toReparent 又把它记了一笔，
+ *   报告会说「调整了 1 个」而实际一个字都没写（假报告）。
+ *   【改名会不会覆盖用户自己的改动】会 —— 但这正是「完全对齐」的定义（用户拍板过），
+ *   且只在和主快照不一致时才写；回档能把改动前的五个字段原样还回去。
+ *   【账本】reparented 升级成 updated：记 before/after 五个字段 + fields（改了哪几项）。
+ *   老账本里的 reparented 仍然认（内部先统一成新格式再处理），升级不会废掉已有撤销点。
+ *   【报告】恢复时写明「更新 N 个（改名 x / 换层级 y / 排序颜色 z）」，
+ *   回档时写明「还原 N 个的名字 / 层级 / 排序」—— 用户验收「汉化过来没有」看的就是这行。
+ * ----------------------------------------------------------------------------
+ * v1.3.5：合集包文件夹结构从「只加不减」改成「完全对齐」——
+ *   修 v1.3.4 在真机上暴露的两个问题（用户原话：
+ *   「换世界后文件夹会累计，而不是重置变成我存入的那套，空的文件夹还是会被新建」）。
+ *   【症状】① 目标世界的夹子 = 它原有的 + 快照带来的，两套并存（越同步越多）；
+ *           ② 主世界里整理后剩下的**空壳夹子**被原样搬进目标世界，得手动一个个删。
+ *   【根因】v1.3.4 的 planCompendiumFolders 只有 toCreate（快照有、当前没有 → 新建）
+ *   与 toReparent（父级不同 → 改），**没有任何删除动作** ⇒ 只做加法，永远收敛不到
+ *   「等于主世界那套」；而 collectCompendiumFolders 收录主世界的**全部** Compendium
+ *   夹子、不看里面有没有包，恢复侧又无条件全建 ⇒ 空壳被逐版复制过去。
+ *   【修法】计划新增 toDelete，语义改成「目标世界的 Compendium 夹子集合 === 快照那套」：
+ *     ① 删「当前有、快照里根本没有」的（多余的）；
+ *     ② 删「当前有、快照里也是空的」（空壳）；
+ *     ③ toCreate 跳过快照里的空壳，不再往目标世界搬空夹子。
+ *   【怎么判「空」】只能看快照自己（见 computeFolderUsage）：从快照的 settings 里取
+ *   core.compendiumConfiguration，取出被包直接引用的夹子，再**自下而上**传播
+ *   （子夹有内容 ⇒ 父夹也不算空），否则会把「有内容后代」的外层夹子当空壳删掉。
+ *   【兜底 · fail closed】快照里没有这份配置（例如恢复时没勾「设置」）⇒ known=false ⇒
+ *   **一个夹子都不删**，只做补齐。宁可不动，也不误删那份没有第二个副本的结构。
+ *   【执行顺序】建 → 补父子 → 删。删除放最后：万一前面失败，用户原有的结构还在。
+ *   【为什么删除是安全的】只删 Folder 文档，**绝不碰 core.compendiumConfiguration** ——
+ *   那份配置里记的仍是原来的 folder _id，所以回档时用同一个 _id 重建夹子（keepId），
+ *   包会**自动回到原位置**、不需要重新归类；包本身在任何时刻都不会丢，
+ *   只是当夹子不存在时显示在侧边栏顶层（compendium-collection.mjs:161-163 的
+ *   get folder() 返回 null —— 正是用户要的「未分类的放在首页」）。
+ *   【账本】folders.deleted 记下被删夹子的完整 6 字段（_id/name/folder/sort/sorting/color），
+ *   回档据此原样重建；「设置全同、只清了空夹子」也算一次可撤销的操作（见 validateApplyLogEntry）。
+ *   【兼容】老快照无 compendiumFolders → 跳过、不删任何东西；老账本无 folders.deleted →
+ *   回档只做 v1.3.4 那几个动作。
  * ----------------------------------------------------------------------------
  * v1.3.4：把「合集包文件夹结构」纳入同步 —— 修一个用户在真机上撞到的结构性缺陷。
  *   【症状】把整理好文件夹的世界同步到一个新世界后，合集包**全部散在文件夹外**，
@@ -434,7 +486,7 @@
 
 /* ============================ 版本与探针 ============================ */
 const MODULE_ID = "lh-world-sync";
-const MODULE_VERSION = "1.3.4";
+const MODULE_VERSION = "1.3.6";
 window.__WSYNC_VER = MODULE_VERSION; // 探针：控制台输入 window.__WSYNC_VER 验版本
 
 /* ============================ 常量 ============================ */
@@ -1053,6 +1105,46 @@ function collectCompendiumFolders() {
     return null;
   }
 }
+// v1.3.5：判定「快照里这套夹子，哪些是真的有内容的」。
+// 依据**只能是快照自己** —— 目标世界的实时状态反映的是它自己的历史，不是主世界的意图；
+// 而且恢复进行到一半时（夹子已建、配置刚写入）用实时状态判会得到错的答案。
+//   ① 直接引用：快照的 core.compendiumConfiguration 里 folder === 夹子 id 的那些包；
+//   ② 自下而上传播：子夹有内容 ⇒ 父夹也不算空（否则会把「有内容后代」的外层夹子
+//      当空壳删掉，连带让那些后代变成孤儿）。
+// known=false 表示「快照里没有这份配置」—— 调用方必须保守：一个夹子都不删（fail closed）。
+function computeFolderUsage(snap) {
+  const folders = Array.isArray(snap?.compendiumFolders) ? snap.compendiumFolders : [];
+  let raw = null;
+  try {
+    const entry = (Array.isArray(snap?.settings) ? snap.settings : [])
+      .find(s => s && s.key === "core.compendiumConfiguration");
+    raw = entry ? entry.value : null;
+    // 兼容两种形态：Setting 的 value 是 JSONField，运行时读出来已经是对象，
+    // 但手改过的快照 / 别的来源可能存成 JSON 字符串。两边都认，别假设类型。
+    if (typeof raw === "string") raw = raw.trim() ? JSON.parse(raw) : null;
+  } catch (e) { raw = null; }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { known: false, used: null };
+  }
+  const used = new Set();
+  for (const v of Object.values(raw)) {
+    const fid = (v && typeof v === "object") ? v.folder : null;
+    if (typeof fid === "string" && fid) used.add(fid);
+  }
+  // 父级传播：一轮轮往上标记，直到不再变化（目录层数很浅，代价可忽略）
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const f of folders) {
+      if (!used.has(f._id)) continue;      // 它自己没内容 → 不影响父级
+      if (!f.folder) continue;             // 已经是顶层
+      if (used.has(f.folder)) continue;    // 父级已标记
+      used.add(f.folder);
+      changed = true;
+    }
+  }
+  return { known: true, used };
+}
 function buildSnapshot() {
   const all = collectWorldSettings();
   const settings = [...all.entries()].map(([key, { value }]) => ({ key, value }));
@@ -1285,9 +1377,17 @@ function validateApplyLogEntry(entry) {
   // 读取侧于是把整个条目丢掉 —— 唯一的撤销点就此静默消失（回档会说「没有可回档记录」）。
   // 现在：只有 prev 与 folders 两边都没有内容时，才算真的没有东西可撤销。
   const fl = entry.folders;
+  // v1.3.5：deleted 也算「这次真的动过」—— 一次「设置全同、只清掉了几个空夹子」的恢复，
+  // 如果只认 created/reparented，那份账本又会被判成「一条记录都没有」而整条丢掉，
+  // 撤销点静默消失（与 v1.3.4 修的是同一类病，多了一个维度就得重审一次判据）。
+  // v1.3.6：judged 的维度又多了一个（updated）—— 一次「设置全同、只把几个夹子改了名」的
+  // 恢复，账本里 created/deleted 都是空的、只有 updated，漏了它这条撤销点又会静默消失。
+  // 老账本（v1.3.5 及更早）写的是 reparented，一并认，否则升级前的撤销点会全部作废。
   const hasFolderWork = !!fl && typeof fl === "object" && !Array.isArray(fl)
     && ((Array.isArray(fl.created) && fl.created.length > 0)
-     || (Array.isArray(fl.reparented) && fl.reparented.length > 0));
+     || (Array.isArray(fl.updated) && fl.updated.length > 0)
+     || (Array.isArray(fl.reparented) && fl.reparented.length > 0)
+     || (Array.isArray(fl.deleted) && fl.deleted.length > 0));
   if (keys.length === 0 && !hasFolderWork) return "prev 里一条记录都没有";
   if (keys.length > 20000) return "条目过多（" + keys.length + " 项，上限 20000）";
   for (const k of keys) {
@@ -1454,12 +1554,23 @@ async function writeApplyLog(prevMap, afterMap, folderPlan) {
     after: afterMap ? Object.fromEntries([...afterMap.entries()]) : {},
     prev: Object.fromEntries([...prevMap.entries()].map(([k, v]) => [k, { present: v.present, value: v.value }])),
     // v1.3.4：本次恢复对「合集包文件夹」做的事 —— 回档据此撤销。
-    //   created    = 本次新建的夹子 id（回档时删，前提是没人再引用它）
-    //   reparented = 本次改过父级的夹子及改动前后的值（回档时还原，前提是用户没再动过）
-    // null / 缺失 = 本次没有文件夹动作。老账本没有这个字段，读取侧一律容忍。
+    //   created = 本次新建的夹子 id（回档时删，前提是没人再引用它）
+    // v1.3.5：
+    //   deleted = 本次**清掉**的夹子，存完整 6 字段（回档要原样重建，只记 id 只能造空壳）
+    // v1.3.6：reparented 升级成 updated —— 记改动前后的**五个字段**
+    //   （name / folder / sort / sorting / color）外加 fields（到底改了哪几项）。
+    //   只比父级时叫 reparented 还贴切；现在名字、排序、颜色都归它管，
+    //   再叫「reparent」就是名不副实，而且会误导下一个读这段代码的人。
+    // null / 缺失 = 本次没有文件夹动作。老账本里只有 reparented，读取侧两种都认。
     folders: (folderPlan && folderPlan.active && folderPlan.total) ? {
       created: folderPlan.toCreate.map(f => f._id),
-      reparented: folderPlan.toReparent.map(r => ({ _id: r._id, before: r.before, after: r.after }))
+      updated: (folderPlan.toUpdate ?? []).map(u => ({
+        _id: u._id, before: u.before, after: u.after, fields: u.fields
+      })),
+      deleted: (folderPlan.toDelete ?? []).map(f => ({
+        _id: f._id, name: f.name, folder: f.folder ?? null,
+        sort: f.sort ?? 0, sorting: f.sorting === "m" ? "m" : "a", color: f.color ?? null
+      }))
     } : null
   };
   await storageWrite(applyLogFile(), JSON.stringify(store, null, 2));
@@ -1622,20 +1733,30 @@ function describeUnavailable(keys) {
 /* ---------- 合集包文件夹：先算清，再动手（v1.3.4） ---------- */
 // 与 applySnapshot 内部的既有模式一致（见它「先算出真正会写什么，再记账、再写」的注释）：
 // 任何写入之前先把完整计划算出来，计划同时供「写账本 / 执行 / 报告」三处使用，绝不边算边写。
-// 冲突语义（用户拍板）：一律按 _id 判断。目标世界已有的同 id 夹子完全不动，
-// 只在「快照里有、当前没有」时新建 —— 宁可多出一个同名夹子，
-// 也不去合并 / 改名 / 搬动用户自己整理过的夹子。
+// 冲突语义：一律按 _id 判断 —— 不去改名、也不去猜「同名是不是同一个夹子」。
+// v1.3.5 起整体语义是「完全对齐」：目标世界的 Compendium 夹子集合 === 快照那套。
+//   建：快照里有、当前没有、**且快照里它有内容**（空壳不再搬过去）；
+//   改：当前父级 ≠ 快照父级；
+//   删：① 当前有、快照里根本没有；② 当前有、快照里也是空的（空壳）。
+// 删除范围由用户在真机上拍板（ask_user_question：「全删，完全等于快照那套」）。
+// 代价已在方案里讲明并获同意：被删夹子里的包回到顶层未分类，包本身不丢，且可回档重建。
 function planCompendiumFolders(snap, sel) {
   if (sel?.includeCompendiumFolders === false) {
-    return { active: false, reason: "not-selected", toCreate: [], toReparent: [], links: [], total: 0 };
+    return { active: false, reason: "not-selected", toCreate: [], toUpdate: [], toDelete: [], links: [], total: 0 };
   }
   const list = Array.isArray(snap?.compendiumFolders) ? snap.compendiumFolders : null;
   if (!list) {
     // 老快照没有这一段：不报错、不删任何东西，只是本次不同步文件夹结构。
-    return { active: false, reason: "old-snapshot", toCreate: [], toReparent: [], links: [], total: 0 };
+    return { active: false, reason: "old-snapshot", toCreate: [], toUpdate: [], toDelete: [], links: [], total: 0 };
   }
-  const existing = new Set(game.folders.filter(f => f.type === "Compendium").map(f => f.id));
-  const toCreate = list.filter(f => !existing.has(f._id)).map(f => ({
+  const usage = computeFolderUsage(snap);
+  const snapIds = new Set(list.map(f => f._id));
+  const current = game.folders.filter(f => f.type === "Compendium");
+  const existing = new Set(current.map(f => f.id));
+  // 快照里「真正要的那套」：known 时只保留有内容的（空壳既不搬、也不留）。
+  // known=false（读不到那份配置）⇒ 无从判断谁空谁不空 ⇒ 全部照建、且一个都不删。
+  const wanted = usage.known ? list.filter(f => usage.used.has(f._id)) : list;
+  const toCreate = wanted.filter(f => !existing.has(f._id)).map(f => ({
     _id: f._id,
     name: f.name,
     type: "Compendium",
@@ -1649,27 +1770,95 @@ function planCompendiumFolders(snap, sel) {
     sorting: f.sorting === "m" ? "m" : "a",
     color: f.color ?? null
   }));
-  // 父子关系：只对「当前父级 ≠ 快照父级」的动手，并记下改动前的值（回档要还原）。
-  // 本次新建的不记 —— 回档把它们整体删掉即可，不需要单独还原父级。
-  const toReparent = [];
-  for (const f of list) {
-    if (!f.folder) continue;
-    if (!existing.has(f._id)) continue;        // 本次新建的，跳过
+  // v1.3.6：对「已经存在的」夹子逐字段比对，不再只比父级。
+  // 起因（真机，2026-10-11）：用户在别处把文件夹改成了中文（德拉肯海姆 / 德拉肯海姆怪物书 /
+  // 斯坦哈德），同步过来名字纹丝不动 —— 因为这里原先只看 id 存不存在，id 一样就整条跳过，
+  // name 根本没人比。汉化这类「同一个夹子、换了个标签」的改动因此永远同步不过去。
+  // 顺带修掉一个 v1.3.5 就有的漏网：快照里是顶层、当前是子夹时，links 只收 f.folder 有值的项，
+  // 于是这个夹子永远不会被移回顶层 —— 可 toReparent 又把它记了一笔，报告会说「调整了 1 个」，
+  // 实际一个字都没写，属于假报告。
+  // 新写法：五个字段逐个比，只把**真正不同**的写进 links（没变化的一个字都不写，
+  // 避免无谓的 update 事件惊动别的模块）。
+  const toUpdate = [];
+  const links = [];
+  for (const f of wanted) {
+    const want = {
+      name: f.name,
+      folder: f.folder ?? null,
+      sort: Number.isFinite(f.sort) ? f.sort : 0,
+      sorting: f.sorting === "m" ? "m" : "a",
+      color: f.color || null            // 空字符串与 null 视为同一件事（都表示没有颜色）
+    };
     const cur = game.folders.get(f._id);
-    if (!cur) continue;
-    const before = cur._source?.folder ?? null;
-    if (before === f.folder) continue;         // 已经对了，不动它
-    toReparent.push({ _id: f._id, before, after: f.folder });
+    if (!cur) {
+      // 本次新建的：名字/排序/颜色在建的时候一起带过去了，
+      // 但父级不行 —— 它的父夹可能也在这一批里、此刻还没建出来，所以只能建完再补。
+      if (want.folder) links.push({ _id: f._id, folder: want.folder });
+      continue;
+    }
+    const before = {
+      name: cur.name,
+      folder: cur._source?.folder ?? null,
+      sort: Number.isFinite(cur.sort) ? cur.sort : 0,
+      sorting: cur.sorting === "m" ? "m" : "a",
+      color: cur.color || null
+    };
+    const patch = { _id: f._id };
+    const fields = [];
+    for (const k of ["name", "folder", "sort", "sorting", "color"]) {
+      if (before[k] === want[k]) continue;
+      patch[k] = want[k];
+      fields.push(k);
+    }
+    if (!fields.length) continue;       // 完全一致 → 一个字都不写
+    links.push(patch);
+    toUpdate.push({ _id: f._id, before, after: want, fields });
   }
+  // v1.3.5：要删的夹子。存**完整字段**而不是只存 id —— 账本要拿它原样重建，
+  // 只记一个 id 的话回档只能造出一个没名字的空壳。
+  const toDelete = [];
+  if (usage.known) {
+    for (const f of current) {
+      const inSnap = snapIds.has(f.id);
+      if (inSnap && usage.used.has(f.id)) continue;   // 快照里有、且有内容 → 留着
+      toDelete.push({
+        _id: f.id,
+        name: f.name,
+        folder: f._source?.folder ?? null,
+        sort: Number.isFinite(f.sort) ? f.sort : 0,
+        sorting: f.sorting === "m" ? "m" : "a",
+        color: f.color ?? null,
+        // 只用于报告里说清「为什么删它」，回档重建时不用
+        why: inSnap ? "主世界里它是空的" : "主世界里没有这个文件夹"
+      });
+    }
+  }
+  // 删除顺序：深的先删。Folder 的父级是 ForeignDocumentField（不是内嵌文档），
+  // 一起删本来也行，但先删子树能保证任何一步中断都不会留下「父已删、子在」的孤儿。
+  const depthOf = (id) => {
+    let d = 0, cur = game.folders.get(id), guard = 0;
+    while (cur && guard++ < 32) {
+      const p = cur._source?.folder ?? null;
+      if (!p) break;
+      d++;
+      cur = game.folders.get(p);
+    }
+    return d;
+  };
+  toDelete.sort((a, b) => depthOf(b._id) - depthOf(a._id));
   return {
     active: true,
     reason: "ok",
+    usageKnown: usage.known,
     toCreate,
-    toReparent,
-    // 补父子关系用「全量清单」（含刚新建的那批），与用户宏里的 links 一致。
-    // 正因为它是全量，多层嵌套一次就位，不需要按深度分轮。
-    links: list.filter(f => f.folder).map(f => ({ _id: f._id, folder: f.folder })),
-    total: toCreate.length + toReparent.length
+    toUpdate,
+    toDelete,
+    // 一次 update 同时干两件事，与用户自己那个宏是同一条路数：
+    //  ① 补父子关系（含刚新建的那批 —— 建的时候一律是顶层，只能在创建之后补）
+    //  ② 把名字 / 层级 / 排序方式 / 排序值 / 颜色改成主世界那套（v1.3.6 新增 ②）
+    // 只列**保留下来**的（wanted）：要删的那些不该再被挂到任何父级上。
+    links,
+    total: toCreate.length + toUpdate.length + toDelete.length
   };
 }
 // 执行文件夹计划。
@@ -1678,7 +1867,9 @@ function planCompendiumFolders(snap, sel) {
 // 不会比同步前更坏（包本来就已经散在外面了）。上层据此如实报告
 // 「设置已恢复，文件夹结构未同步」，用户修好原因后可以再恢复一次。
 async function applyCompendiumFolders(plan) {
-  const done = { created: [], reparented: [] };
+  // usageKnown 一路带到报告里：快照没带合集包配置时一个夹子都不会删，
+  // 用户冲着「清空夹子」来的，必须让他知道这次为什么没清（见 openApplyReportDialog）。
+  const done = { created: [], updated: [], deleted: [], usageKnown: !!plan?.usageKnown };
   if (!plan?.active || !plan.total) return done;
   const FolderCls = foundry.utils.getDocumentClass("Folder");
   if (plan.toCreate.length) {
@@ -1698,8 +1889,23 @@ async function applyCompendiumFolders(plan) {
     }
   }
   if (plan.links?.length) {
+    // links 里既有「补父子」也有「改名/换层级/改排序颜色」，一次写完。
+    // updateDocuments 的数组字段是整段替换语义，这里每项只带自己那几个字段，
+    // 没列到的字段一律不动 —— 正是我们要的（只改差异）。
     await FolderCls.updateDocuments(plan.links, { render: false });
-    done.reparented = plan.toReparent.map(r => ({ ...r }));
+  }
+  // v1.3.6：这一行移到 if 外面。旧写法把赋值放在 `if (plan.links?.length)` 里，
+  // 于是 links 为空时会漏报 —— 报告里的「更新 N 个」凭空少一截，
+  // 而用户事后只有这一份报告可以回看（第四轮盲审 T4 的教训）。
+  done.updated = (plan.toUpdate ?? []).map(u => ({ ...u }));
+  // v1.3.5：删除放最后一步 —— 前面任何一步抛错时，用户原有的结构还原封不动地留着，
+  // 而不是「建了一半 + 已经删了」这种最难善后的中间态。
+  // 只删 Folder 文档本身，core.compendiumConfiguration 一个字都不碰：
+  // 所以被删夹子里的包不会丢内容，只是暂时显示到顶层（未分类）；
+  // 回档用同一个 _id 把夹子重建回来后，配置里那条引用又能查到，包自动归位。
+  if (plan.toDelete?.length) {
+    await FolderCls.deleteDocuments(plan.toDelete.map(f => f._id), { render: false });
+    done.deleted = plan.toDelete.map(f => ({ ...f }));
   }
   return done;
 }
@@ -1998,7 +2204,7 @@ async function rollbackApplyLog() {
     // 只删「本次建的 + 现在没有任何包引用它 + 里面没有子夹」的；任何一条不满足就保留并报出来。
     // 读不到配置时一个都不删（fail closed：宁可留下一个空夹子，也不能把用户
     // 自己整理过的结构删掉 —— 那份结构没有第二个副本）。
-    const folderUndo = { deleted: [], reparented: [], kept: [], error: null };
+    const folderUndo = { deleted: [], updated: [], rebuilt: [], kept: [], error: null };
     const flog = (log.folders && typeof log.folders === "object" && !Array.isArray(log.folders)) ? log.folders : null;
     if (flog) {
       const FolderCls = foundry.utils.getDocumentClass("Folder");
@@ -2016,18 +2222,90 @@ async function rollbackApplyLog() {
         if (f.getSubfolders(false).length) { folderUndo.kept.push({ id, name: f.name, why: "里面还有子文件夹" }); continue; }
         toDelete.push(id);
       }
-      const relink = [];
-      for (const r of (Array.isArray(flog.reparented) ? flog.reparented : [])) {
-        const f = game.folders.get(r?._id);
-        if (!f) continue;
-        const now = f._source?.folder ?? null;
-        // 回档之后用户自己又挪过它 —— 那是他的成果，保留不动
-        //（与 v1.3.1 修 S4「别把用户后来重新配置的值一起删掉」同一条判据）。
-        if (now !== (r.after ?? null)) {
-          folderUndo.kept.push({ id: r._id, name: f.name, why: "回档前你已经把它移到别处了" });
+      // v1.3.5：再还原本次**清掉**的夹子。
+      // 上面已经把 core.compendiumConfiguration 还原成回档前的值，那份配置里记的就是
+      // 这些夹子的 _id —— 用同一个 _id 重建回来之后，配置里那条引用又能查到，
+      // 包自动回到原位置，不需要用户重新归类。
+      const toRebuild = [], rebuildLinks = [];
+      for (const d of (Array.isArray(flog.deleted) ? flog.deleted : [])) {
+        if (!d || typeof d._id !== "string" || !d._id) continue;
+        if (game.folders.get(d._id)) {
+          folderUndo.kept.push({ id: d._id, name: d.name ?? d._id, why: "同 id 的文件夹已经存在" });
           continue;
         }
-        relink.push({ _id: r._id, folder: r.before ?? null });
+        toRebuild.push({
+          _id: d._id,
+          name: (typeof d.name === "string" && d.name) ? d.name : "（未命名）",
+          type: "Compendium",
+          folder: null,          // 先建为顶层：父夹可能也刚被重建，一起建完再补关系
+          sort: Number.isFinite(d.sort) ? d.sort : 0,
+          sorting: d.sorting === "m" ? "m" : "a",
+          color: d.color ?? null
+        });
+        if (d.folder) rebuildLinks.push({ _id: d._id, folder: d.folder });
+      }
+      try {
+        if (toRebuild.length) {
+          // keepId:true —— 与创建路径同一条命门，换了 id 配置里那条引用就又查不到了
+          await FolderCls.createDocuments(toRebuild, { keepId: true, render: false });
+          // 父级可能自己也被删过、刚刚才重建出来，所以补链接必须放在创建**之后**。
+          // 父级确实不在了的（用户后来自己删了）跳过，不让一次 update 整体抛错。
+          const okLinks = rebuildLinks.filter(l => game.folders.get(l.folder));
+          if (okLinks.length) await FolderCls.updateDocuments(okLinks, { render: false });
+          folderUndo.rebuilt = toRebuild.map(r => r._id);
+        }
+      } catch (e) {
+        console.error("[lh-world-sync] 合集包文件夹重建失败（设置已还原，文件夹可能少几个）", e);
+        folderUndo.error = e?.message || String(e);
+      }
+      // v1.3.6：还原本次改过「名字 / 层级 / 排序 / 颜色」的夹子。
+      // 老账本（v1.3.5 及更早）里这段叫 reparented、只记 folder 一项 ——
+      // 先统一成新格式再走同一套逻辑，不为旧格式另写一份
+      //（「同一件事存在多套语义」正是 v1.3.3 那次栽的跟头，不再重复）。
+      const relink = [];
+      const undoList = [];
+      for (const u of (Array.isArray(flog.updated) ? flog.updated : [])) {
+        if (u && typeof u._id === "string" && u._id) {
+          undoList.push({ _id: u._id, before: u.before || {}, after: u.after || {} });
+        }
+      }
+      for (const r of (Array.isArray(flog.reparented) ? flog.reparented : [])) {
+        if (r && typeof r._id === "string" && r._id) {
+          undoList.push({
+            _id: r._id,
+            before: { folder: r.before ?? null },
+            after: { folder: r.after ?? null }
+          });
+        }
+      }
+      for (const u of undoList) {
+        const f = game.folders.get(u._id);
+        if (!f) continue;
+        const now = {
+          name: f.name,
+          folder: f._source?.folder ?? null,
+          sort: Number.isFinite(f.sort) ? f.sort : 0,
+          sorting: f.sorting === "m" ? "m" : "a",
+          color: f.color || null
+        };
+        const patch = { _id: u._id };
+        let dirty = false, drift = false;
+        for (const k of ["name", "folder", "sort", "sorting", "color"]) {
+          if (!(k in u.after)) continue;    // 这一项本次根本没动过，别碰
+          const was = now[k];
+          const wrote = u.after[k] ?? null; // 恢复时我们写进去的值
+          const orig = u.before[k] ?? null; // 恢复之前它本来是什么
+          if (was === orig) continue;       // 已经等于原值了，不必再写一遍
+          // 回档之后用户自己又改过它 —— 那是他的成果，保留不动
+          //（与 v1.3.1 修 S4「别把用户后来重新配置的值一起删掉」同一条判据）。
+          if (was !== wrote) { drift = true; continue; }
+          patch[k] = orig;
+          dirty = true;
+        }
+        if (drift) {
+          folderUndo.kept.push({ id: u._id, name: f.name, why: "回档前你已经自己改过它了" });
+        }
+        if (dirty) relink.push(patch);
       }
       try {
         if (toDelete.length) {
@@ -2036,7 +2314,7 @@ async function rollbackApplyLog() {
         }
         if (relink.length) {
           await FolderCls.updateDocuments(relink, { render: false });
-          folderUndo.reparented = relink.map(r => r._id);
+          folderUndo.updated = relink.map(r => r._id);
         }
       } catch (e) {
         // 文件夹没还原干净 ≠ 设置没还原。如实带上去，让它出现在回档报告里。
@@ -2161,7 +2439,7 @@ function panelContentHTML(snapNs, pref) {
           <label class="wsync-ns-row"><input type="checkbox" id="wsync-ns-all" value="*"${allChecked ? " checked" : ""}><span class="wsync-ns-name"><b>全选</b></span><span class="wsync-ns-count">${count} 个模块</span></label>
           ${rows}
           <label class="wsync-ns-row wsync-ns-modcfg"><input type="checkbox" id="wsync-modcfg" value="modcfg"${modCfgChecked ? " checked" : ""}><span class="wsync-ns-name">模组启用状态<em class="wsync-ns-title">对应「设置 → 管理模组」中的开关</em></span><span class="wsync-ns-count">随快照恢复</span></label>
-          <label class="wsync-ns-row wsync-ns-modcfg"><input type="checkbox" id="wsync-compfolders" value="compfolders"${compFoldersChecked ? " checked" : ""}><span class="wsync-ns-name">合集包文件夹结构<em class="wsync-ns-title">把「哪个合集包放在哪个文件夹里」的夹子一起带过来</em></span><span class="wsync-ns-count">随快照恢复</span></label>
+          <label class="wsync-ns-row wsync-ns-modcfg"><input type="checkbox" id="wsync-compfolders" value="compfolders"${compFoldersChecked ? " checked" : ""}><span class="wsync-ns-name">合集包文件夹结构<em class="wsync-ns-title">按主世界对齐合集包的文件夹：缺的补上、多出来的和空掉的清掉（包不会丢，只会回到合集包列表顶层）</em></span><span class="wsync-ns-count">随快照恢复</span></label>
         </div>
         <div class="wsync-scope-hint" id="wsync-scope-hint">当前范围：<b>${scopeNow}</b>${extra ? " · 其中 " + extra + " 个模块本世界还没有它的设置（来自主快照）" : ""} · 改动后点「保存范围」，会存成这个世界的长期偏好——「恢复主世界」与进世界自动提醒都按它执行。</div>
         <label class="wsync-ns-row wsync-ns-autoprompt"><input type="checkbox" id="wsync-autoprompt"${game.settings.get(MODULE_ID, "autoPrompt") ? " checked" : ""}><span class="wsync-ns-name">进入世界时自动提醒<em class="wsync-ns-title">关闭后仅在手动点击「恢复主世界」时执行恢复</em></span></label>
@@ -2324,8 +2602,14 @@ async function proceedApplySnap(changed) {
     if (res.locked || res.denied || res.busy) return;
     // v1.3.4：合集包文件夹也是「这次真的做了事」的一种 —— 只同步了文件夹时
     // 不能说「当前世界与主世界基准一致，无需恢复」（那是假话，夹子明明刚建出来）。
+    // v1.3.5：deleted 同样算 —— 一次「设置全同、只清掉了几个空夹子」的恢复，
+    // 少了这一项就会被下面判成「基准一致，无需恢复」：夹子明明刚被清掉，界面却说没事发生，
+    // 恢复报告也不会弹（那是用户事后唯一能回看的凭据）。
+    //（又一次印证：判据里「有没有内容」的定义一变，所有读它的地方都得回头重审。）
     const folderTouched = !!(res.folders
-      && (((res.folders.created?.length) ?? 0) || ((res.folders.reparented?.length) ?? 0)));
+      && (((res.folders.created?.length) ?? 0)
+        || ((res.folders.updated?.length) ?? 0)
+        || ((res.folders.deleted?.length) ?? 0)));
     if (!res.applied.length && !folderTouched) {
       // v1.2.5：区分「真的没有差异」与「有差异但全被跳过（本机没装那些模组）」——
       // 后者说成「基准一致」是假话，而且会让用户以为已经恢复过了。
@@ -2361,12 +2645,41 @@ function openApplyReportDialog(applied, skipped, folders, folderError) {
   // v1.3.4：合集包文件夹的同步结果，报告里必须有一行 ——
   // 报告是用户事后唯一能回看的凭据（第四轮盲审 T4 的教训），漏了就等于没做。
   const nFoldCreated = folders?.created?.length ?? 0;
-  const nFoldReparent = folders?.reparented?.length ?? 0;
+  // v1.3.5：清掉的数量也要报 —— 这是本次改动里用户最能直接看见的一项，
+  // 不写进报告他就只能自己数侧边栏（报告是他事后唯一能回看的凭据）。
+  const nFoldDeleted = folders?.deleted?.length ?? 0;
+  // v1.3.6：更新项要细分到「改名 / 换层级 / 排序颜色」。
+  // 用户这次是冲着「汉化同步不过去」来的 —— 报告里只写一句「更新 3 个」，
+  // 他没法判断自己的问题解决了没有；写上「改名 3」才是能验收的凭据。
+  const updList = Array.isArray(folders?.updated) ? folders.updated : [];
+  const nFoldUpdated = updList.length;
+  let nUpdName = 0, nUpdFolder = 0, nUpdSort = 0;
+  for (const u of updList) {
+    const fs = Array.isArray(u?.fields) ? u.fields : [];
+    if (fs.indexOf("name") >= 0) nUpdName++;
+    if (fs.indexOf("folder") >= 0) nUpdFolder++;
+    if (fs.indexOf("sort") >= 0 || fs.indexOf("sorting") >= 0 || fs.indexOf("color") >= 0) nUpdSort++;
+  }
+  const updDetail = [
+    nUpdName ? `改名 ${nUpdName}` : "",
+    nUpdFolder ? `换层级 ${nUpdFolder}` : "",
+    nUpdSort ? `排序颜色 ${nUpdSort}` : ""
+  ].filter(Boolean).join(" / ");
+  const folderParts = [
+    nFoldCreated ? `新建 <b>${nFoldCreated}</b> 个` : "",
+    nFoldUpdated ? `更新 <b>${nFoldUpdated}</b> 个${updDetail ? `（${updDetail}）` : ""}` : "",
+    nFoldDeleted ? `清掉 <b>${nFoldDeleted}</b> 个多余的 / 空的` : ""
+  ].filter(Boolean).join("，");
+  // v1.3.5：快照里没带 core.compendiumConfiguration 时一个夹子都不删（fail closed），
+  // 但用户是冲着「清空夹子」来的 —— 必须说清这次为什么一个都没清，否则他会以为没生效。
+  const noUsageNote = (folders && folders.usageKnown === false)
+    ? "（本次没有清理任何文件夹：快照里没带合集包配置，无法判断哪些是空的。重新「存主世界」时确保勾上设置即可）"
+    : "";
   const folderNote = folderError
     ? `<div class="wsync-diff-more"><b>合集包文件夹结构没有同步成功</b>（设置已恢复，不受影响）：${escapeHtml(folderError)}<br>修好原因后再点一次「恢复主世界」即可补上。</div>`
-    : ((nFoldCreated || nFoldReparent)
-      ? `<div class="wsync-diff-more">合集包文件夹结构已同步：新建 <b>${nFoldCreated}</b> 个文件夹${nFoldReparent ? "，调整 " + nFoldReparent + " 个文件夹的层级" : ""}。刷新后合集包会自动归位。</div>`
-      : "");
+    : (folderParts
+      ? `<div class="wsync-diff-more">合集包文件夹结构已按主世界对齐：${folderParts}。刷新后合集包会自动归位；被清掉文件夹里的包会显示在合集包列表顶层，<b>包本身不会丢</b>。${noUsageNote}</div>`
+      : (noUsageNote ? `<div class="wsync-diff-more">合集包文件夹结构本次无改动。${noUsageNote}</div>` : ""))
   // v1.2.6（第四轮盲审 T4）：原来「另有 N 项未恢复」只出现在一条瞬时通知里，
   // 不进报告、不进「上一次恢复改动了什么」—— 刷新之后这句话就消失了。
   // 报告是用户事后唯一能回看的凭据，缺这项就等于没说过。
@@ -2535,17 +2848,24 @@ async function doRollback() {
     // 而文件夹结构其实刚刚被还原了，那句话是假的。
     const fu = res.folderUndo;
     const nFoldDeleted = fu?.deleted?.length ?? 0;
-    const nFoldRelink = fu?.reparented?.length ?? 0;
+    const nFoldRelink = fu?.updated?.length ?? 0;
     const nFoldKept = fu?.kept?.length ?? 0;
-    const folderHead = (nFoldDeleted || nFoldRelink)
-      ? `，并还原了合集包文件夹结构（删除新建的 <b>${nFoldDeleted}</b> 个文件夹${nFoldRelink ? "、还原 " + nFoldRelink + " 个文件夹的层级" : ""}）`
+    // v1.3.5：被清掉的夹子这次是**重建**回来的，也要报（它在列表里看不到变化，
+    // 但用户的包能不能归位全靠这一步）。
+    const nFoldRebuilt = fu?.rebuilt?.length ?? 0;
+    const folderHead = (nFoldDeleted || nFoldRelink || nFoldRebuilt)
+      ? `，并还原了合集包文件夹结构（${[
+          nFoldDeleted ? `删除本次新建的 <b>${nFoldDeleted}</b> 个` : "",
+          nFoldRebuilt ? `重建被清掉的 <b>${nFoldRebuilt}</b> 个` : "",
+          nFoldRelink ? `还原 <b>${nFoldRelink}</b> 个的名字 / 层级 / 排序` : ""
+        ].filter(Boolean).join("、")}）`
       : "";
     const folderNote = fu?.error
       ? `<div class="wsync-diff-more"><b>合集包文件夹结构没有还原成功</b>（设置已还原）：${escapeHtml(fu.error)}<br>请到侧边栏「合集包」里手动看一下这几个文件夹。</div>`
       : (nFoldKept
         ? `<div class="wsync-diff-more">有 <b>${nFoldKept}</b> 个文件夹<b>原样保留</b>，没有删：${escapeHtml(fu.kept.slice(0, 3).map(k => k.name + "（" + k.why + "）").join("；"))}${nFoldKept > 3 ? " 等" : ""}。</div>`
         : "");
-    const head = (res.changedCount || nFoldDeleted || nFoldRelink)
+    const head = (res.changedCount || nFoldDeleted || nFoldRelink || nFoldRebuilt)
       ? `已回档 ${res.changedCount} 项设置${folderHead}。${skippedNote}`
       : `上次恢复涉及的设置在本世界已经不存在，无需回档。`;
     new Dialog({
